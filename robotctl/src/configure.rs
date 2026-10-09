@@ -136,7 +136,7 @@ fn apply_for(key: &str) -> Option<Apply> {
         // to run (`--should-run`). `apply_for` names one daemon; `plan_for_keys` adds `padd`.
         "netpad" => Apply::Restart("netpadd"),
         "bus" | "control" | "update_gate" | "policy" | "safety" | "chorale" | "idle"
-        | "theremin" | "pickup" | "audio" => Apply::Restart("robotd"),
+        | "theremin" | "pickup" | "audio" | "emotions" => Apply::Restart("robotd"),
         _ => return None,
     })
 }
