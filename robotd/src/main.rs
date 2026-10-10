@@ -1891,6 +1891,8 @@ fn try_controller(
             ground_pick_end_phase: policy_cfg.ground_pick_end_phase,
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+            ground_pick_mouth: policy_cfg.ground_pick_mouth,
+            ground_pick_mouth_close: policy_cfg.ground_pick_mouth_close,
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
@@ -3715,12 +3717,16 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
-        // The mouth is not part of any policy; the intent is the only thing that moves it.
+        // The mouth is not part of any policy; the intent moves it, except under a ground pick
+        // that plays its own trained beak (`[policy] ground_pick_mouth`).
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
         if driving && theremin_state.is_none() && chorale_state.is_none() {
-            targets[duck_control::model::MOUTH_INDEX] =
-                duck_control::model::mouth_target(snapshot.mouth);
+            let mouth = controller
+                .as_ref()
+                .and_then(Controller::ground_pick_mouth)
+                .unwrap_or(snapshot.mouth);
+            targets[duck_control::model::MOUTH_INDEX] = duck_control::model::mouth_target(mouth);
         }
 
         // The next feature row pairs its reading with this command.

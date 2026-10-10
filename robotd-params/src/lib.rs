@@ -1156,6 +1156,13 @@ pub struct PolicyParams {
     pub ground_pick_action_scale: Option<f64>,
     /// Gain multiplier while the ground pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// The beak opening, 0..1 in `robot.mouth` units, that the ground pick plays on its own
+    /// phase clock: for a pick trained with a scripted mouth, which no client can play — padd
+    /// re-sends the trigger's mouth every tick, and its clock is not the pick's. Absent: the
+    /// mouth follows the intent during a pick as at any other time.
+    pub ground_pick_mouth: Option<f64>,
+    /// The pick phase at which that beak starts closing on what it reached for.
+    pub ground_pick_mouth_close: f64,
     /// The one-shot skills this robot has, in priority order.
     ///
     /// Empty means the built-in three — kicks and roulade, with the numbers they have always
@@ -1725,6 +1732,9 @@ pub struct ResolvedPolicy {
     pub ground_pick_end_phase: f64,
     pub ground_pick_action_scale: f64,
     pub ground_pick_gain_ratio: f64,
+    /// The beak opening the pick plays; `None` leaves the mouth to the intent.
+    pub ground_pick_mouth: Option<f64>,
+    pub ground_pick_mouth_close: f64,
     /// Seconds the sitstand network rises before the gait takes over.
     pub sitstand_rise_s: f64,
     /// Seconds the seat takes to settle after the flag flips.
@@ -1941,6 +1951,8 @@ impl PolicyParams {
                     Mode::Roller => 0.8,
                 }),
             ground_pick_gain_ratio: self.ground_pick_gain_ratio,
+            ground_pick_mouth: self.ground_pick_mouth,
+            ground_pick_mouth_close: self.ground_pick_mouth_close,
             sitstand_rise_s: seat.map_or(DEFAULT_SITSTAND_RISE_S, |t| t.rise_s),
             sitstand_ramp_s: seat.map_or(DEFAULT_SITSTAND_RAMP_S, |t| t.ramp_s),
             skills,
@@ -2029,6 +2041,9 @@ impl Default for PolicyParams {
             ground_pick_period: None,
             ground_pick_action_scale: None,
             ground_pick_gain_ratio: 1.0,
+            ground_pick_mouth: None,
+            // The grasp pick's training schedule (`CLOSE_START` in `microduck_rl`).
+            ground_pick_mouth_close: 0.30,
             skills: Vec::new(),
             voltage_adapt: true,
             nominal_voltage: 7.4,
@@ -2670,6 +2685,32 @@ mod tests {
             tuned.ground_pick_end_phase, 0.7,
             "there is no key for the cutoff"
         );
+    }
+
+    /// The pick's beak is opt-in: a file that does not name it is a robot whose mouth follows
+    /// the intent through a pick, as every robot did before a pick was trained with one.
+    #[test]
+    fn the_ground_pick_mouth_is_off_unless_a_file_sets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let unset = Params::load(&write(dir.path(), "[policy]\n"), true)
+            .unwrap()
+            .policy
+            .resolved();
+        assert_eq!(unset.ground_pick_mouth, None);
+        assert_eq!(unset.ground_pick_mouth_close, 0.30, "the training schedule");
+
+        let set = Params::load(
+            &write(
+                dir.path(),
+                "[policy]\nground_pick_mouth = 0.88\nground_pick_mouth_close = 0.32\n",
+            ),
+            true,
+        )
+        .unwrap()
+        .policy
+        .resolved();
+        assert_eq!(set.ground_pick_mouth, Some(0.88));
+        assert_eq!(set.ground_pick_mouth_close, 0.32);
     }
 
     /// **The set says how the sit↔stand is timed.** The rise was a literal second and the

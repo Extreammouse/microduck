@@ -185,6 +185,11 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+# A pick trained with a scripted beak: robotd plays it on the pick's own phase, open to this
+# (robot.mouth units; 0.88 is the trained 26°) over 2-10% of the cycle, closed on the object over
+# the 6% from ground_pick_mouth_close. Unset, the mouth follows the trigger through a pick.
+# ground_pick_mouth = 0.88
+# ground_pick_mouth_close = 0.30
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5

@@ -50,6 +50,14 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
 
+/// The ground pick's scripted beak, as fractions of the pick's cycle: it opens over
+/// 0.02..0.10, and closes over `ground_pick_mouth_close` plus 0.06. Constants because they are
+/// the schedule the pick was trained on (`MouthScheduleActionCfg`, `microduck_rl` branch
+/// `ground-grasp`); only the close has a key, being the moment that has to meet the object.
+const PICK_MOUTH_OPEN_START: f64 = 0.02;
+const PICK_MOUTH_OPEN_END: f64 = 0.10;
+const PICK_MOUTH_CLOSE_LEN: f64 = 0.06;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
     /// Scales raw policy output before it becomes a joint offset. The prototype's current
@@ -92,6 +100,11 @@ pub struct SkillTuning {
     pub ground_pick_action_scale: f64,
     /// Gain multiplier while the pick runs.
     pub ground_pick_gain_ratio: f64,
+    /// The beak opening the pick plays on its phase, in `robot.mouth` units. `None` leaves the
+    /// mouth to the intent — see [`Controller::ground_pick_mouth`].
+    pub ground_pick_mouth: Option<f64>,
+    /// The pick phase at which that beak starts closing.
+    pub ground_pick_mouth_close: f64,
     /// How long the sitstand network rises (posture flag 0) before the main policy takes over.
     /// 1 s is enough on the robot — velstand owns the tail of the rise fine.
     pub sitstand_rise_s: f64,
@@ -111,11 +124,25 @@ impl Default for SkillTuning {
             ground_pick_end_phase: robotd_params::DEFAULT_GROUND_PICK_END_PHASE,
             ground_pick_action_scale: 1.0,
             ground_pick_gain_ratio: 1.0,
+            ground_pick_mouth: None,
+            ground_pick_mouth_close: 0.30,
             sitstand_rise_s: robotd_params::DEFAULT_SITSTAND_RISE_S,
             sitstand_ramp_s: robotd_params::DEFAULT_SITSTAND_RAMP_S,
             skills: Vec::new(),
         }
     }
+}
+
+/// The pick's beak at `phase`: closed, opening, held open, closing, closed — the training
+/// env's `mouth_schedule_fraction` times the configured opening. `None` without a pick or an
+/// opening. Closed is `mouth_target(0.0)`, −5°, past where the pads meet: it squeezes what it
+/// holds, as in training.
+fn pick_mouth(skills: &SkillTuning, phase: Option<f64>) -> Option<f64> {
+    let (open, phase) = (skills.ground_pick_mouth?, phase?);
+    let opening = ((phase - PICK_MOUTH_OPEN_START) / (PICK_MOUTH_OPEN_END - PICK_MOUTH_OPEN_START))
+        .clamp(0.0, 1.0);
+    let closing = ((phase - skills.ground_pick_mouth_close) / PICK_MOUTH_CLOSE_LEN).clamp(0.0, 1.0);
+    Some(open * opening * (1.0 - closing))
 }
 
 /// One tick's worth of decisions, for the caller to act on and report.
@@ -397,6 +424,18 @@ impl Controller {
         }
         self.ground_pick = Some(0.0);
         Ok(())
+    }
+
+    /// The beak opening the running ground pick plays, for the caller to write in place of the
+    /// mouth intent. `None` when no pick runs or none is configured — the intent's mouth then.
+    ///
+    /// Keyed on this pick's own phase because nothing outside can be: padd re-sends the
+    /// trigger's mouth every tick, and a cue timed from the button press would also play for a
+    /// pick that was refused. Read after [`Self::step`], the phase is one tick ahead of the one
+    /// the legs ran on — 0.005 of a 4 s cycle, inside the ±0.01 the close is jittered by in
+    /// training.
+    pub fn ground_pick_mouth(&self) -> Option<f64> {
+        pick_mouth(&self.skills, self.ground_pick)
     }
 
     /// Every one-shot skill this robot has, in priority order — what a client may ask for.
@@ -858,6 +897,36 @@ mod tests {
         assert_eq!(robotd_params::DEFAULT_SITSTAND_RISE_S, 1.0);
     }
 
+    /// The pick's beak plays the schedule the pick was trained with — closed as it starts, open
+    /// on the way down, closed on the object from `ground_pick_mouth_close` on — and nothing at
+    /// all unless configured or outside a pick, where the intent owns the mouth.
+    #[test]
+    fn the_pick_mouth_plays_the_training_schedule() {
+        let skills = SkillTuning {
+            ground_pick_mouth: Some(0.88),
+            ..SkillTuning::default()
+        };
+        let at = |phase: f64| pick_mouth(&skills, Some(phase)).expect("configured and running");
+        assert_eq!(at(0.0), 0.0, "closed as the pick starts");
+        assert!((at(0.06) - 0.44).abs() < 1e-9, "halfway open at 0.06");
+        assert_eq!(at(0.2), 0.88, "fully open on the way down");
+        assert!((at(0.33) - 0.44).abs() < 1e-9, "halfway closed at 0.33");
+        for phase in [0.4, 0.5, 0.7] {
+            assert_eq!(at(phase), 0.0, "closed on the object at {phase}");
+        }
+
+        assert_eq!(
+            pick_mouth(&skills, None),
+            None,
+            "no pick: the intent's mouth"
+        );
+        assert_eq!(
+            pick_mouth(&SkillTuning::default(), Some(0.2)),
+            None,
+            "unset: today's mouth, unchanged"
+        );
+    }
+
     /// A controller with every slot loaded — the feedforward fixture stands in for each net, which
     /// is all the gating needs — and two skills: a kick that does not chain and a roll that does.
     fn full_controller() -> Controller {
@@ -897,6 +966,21 @@ mod tests {
                 .step(&sensors, &Command::default(), false, 0.02, 1.0)
                 .unwrap();
         }
+    }
+
+    /// The beak belongs to the pick that plays it: nothing before the pick, the schedule while it
+    /// runs, and the intent's mouth again once it hands back.
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn the_pick_mouth_ends_with_the_pick() {
+        let mut c = full_controller();
+        c.skills.ground_pick_mouth = Some(0.88);
+        assert_eq!(c.ground_pick_mouth(), None);
+        assert_eq!(c.start_ground_pick(), Ok(()));
+        tick(&mut c, 0.8);
+        assert_eq!(c.ground_pick_mouth(), Some(0.88), "open on the way down");
+        tick(&mut c, 2.4);
+        assert_eq!(c.ground_pick_mouth(), None, "the pick has handed back");
     }
 
     /// **Nothing starts from the seat but standing up.** A kick or a pick from a sitting robot

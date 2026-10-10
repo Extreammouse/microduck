@@ -234,6 +234,16 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Float,
         "Gain multiplier during the ground pick",
     ),
+    entry(
+        "policy.ground_pick_mouth",
+        Kind::OptionalFloat,
+        "Beak opening the ground pick plays on its phase; unset = the mouth follows the intent",
+    ),
+    entry(
+        "policy.ground_pick_mouth_close",
+        Kind::Float,
+        "Pick phase at which that beak starts closing",
+    ),
     feature(
         "policy.voltage_adapt",
         Kind::Bool,
