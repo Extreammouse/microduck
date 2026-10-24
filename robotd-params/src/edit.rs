@@ -742,8 +742,8 @@ mod tests {
         let m = model("");
         for row in m.rows() {
             assert!(!row.overridden(), "{}", row.entry.key);
-            // X, Y and the bumpers ship with no skill, and an empty binding is a button switched off.
-            if !matches!(row.entry.key, "pad.x" | "pad.y" | "pad.lb" | "pad.rb") {
+            // X and Y ship with no skill, and an empty binding is a button switched off.
+            if !matches!(row.entry.key, "pad.x" | "pad.y") {
                 assert!(!row.effective().is_empty(), "{}", row.entry.key);
             }
         }

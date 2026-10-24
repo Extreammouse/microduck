@@ -255,8 +255,8 @@ impl Default for PadImuHeadControlParams {
 /// needs. It would also put "the button that stops the robot" behind a config key, which is the
 /// one binding worth not being able to lose.
 ///
-/// The defaults keep the pad sparse on purpose: A sits or stands, B picks up, and X, Y and the
-/// bumpers do nothing until somebody puts a skill there (the kicks are still in the set, unbound). A named button is rebound; the rest
+/// The defaults keep the pad sparse on purpose: A sits or stands, B picks up, the bumpers kick,
+/// and X and Y do nothing until somebody puts a skill there. A named button is rebound; the rest
 /// stay as they were.
 ///
 /// A name here is not checked against anything at parse time: which skills exist is a property of
@@ -288,8 +288,8 @@ impl Default for PadParams {
             b: "ground_pick".to_owned(),
             x: String::new(),
             y: String::new(),
-            lb: String::new(),
-            rb: String::new(),
+            lb: "kick_left".to_owned(),
+            rb: "kick_right".to_owned(),
         }
     }
 }
@@ -3163,7 +3163,7 @@ mod tests {
         );
     }
 
-    /// The shipped mapping: A sits, B picks up, X, Y and the bumpers are free.
+    /// The shipped mapping: A sits, B picks up, the bumpers kick, X and Y are free.
     #[test]
     fn the_default_bindings() {
         let pad = super::PadParams::default();
@@ -3171,8 +3171,8 @@ mod tests {
         assert_eq!(pad.b, "ground_pick");
         assert_eq!(pad.x, "");
         assert_eq!(pad.y, "");
-        assert_eq!(pad.lb, "");
-        assert_eq!(pad.rb, "");
+        assert_eq!(pad.lb, "kick_left");
+        assert_eq!(pad.rb, "kick_right");
     }
 
     /// **The D-pad stopped being bindable, and a robot still carrying the old key boots.** It is
