@@ -78,6 +78,8 @@ impl Default for PoseIntent {
 pub struct SkillRequests {
     /// Phase-scripted, and still its own thing until the descriptor grows a command generator.
     pub ground_pick: bool,
+    /// The second phase-scripted pick, likewise.
+    pub ground_grasp: bool,
     /// Latched, and driven internally by the shutdown sit as well as by a button, which is why it
     /// is not one of the configurable one-shots either.
     pub sit_toggle: bool,
@@ -91,7 +93,7 @@ pub struct SkillRequests {
 
 impl SkillRequests {
     pub fn any(&self) -> bool {
-        self.ground_pick || self.sit_toggle || self.skills != 0
+        self.ground_pick || self.ground_grasp || self.sit_toggle || self.skills != 0
     }
 
     /// The indices requested, lowest first — which is priority order, since the skill list is
@@ -101,9 +103,10 @@ impl SkillRequests {
     }
 }
 
-// Bit positions for the two skills that are not in the configurable list.
+// Bit positions for the three skills that are not in the configurable list.
 const SKILL_GROUND_PICK: u32 = 1 << 0;
 const SKILL_SIT_TOGGLE: u32 = 1 << 1;
+const SKILL_GROUND_GRASP: u32 = 1 << 2;
 
 /// How many configurable one-shots a robot may have, bounded by the mask being a `u32`.
 ///
@@ -111,10 +114,10 @@ const SKILL_SIT_TOGGLE: u32 = 1 << 1;
 /// thirty of them is thirty ONNX sessions and thirty warm-up inferences before the first tick.
 /// The ceiling is here so that exceeding it is a refusal with a reason rather than a silently
 /// ignored button.
-pub const MAX_SKILLS: usize = 30;
+pub const MAX_SKILLS: usize = 29;
 
-/// Bits the two non-configurable skills occupy at the bottom of the mask.
-const SKILL_BITS: usize = 2;
+/// Bits the three non-configurable skills occupy at the bottom of the mask.
+const SKILL_BITS: usize = 3;
 
 /// How fresh a wheee hold must be to still count as held. `padd` re-notifies every tick
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
@@ -344,6 +347,12 @@ impl Intents {
             .fetch_or(SKILL_GROUND_PICK, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Queue the ground grasp, the second pick.
+    pub fn request_ground_grasp(&self) {
+        self.skills
+            .fetch_or(SKILL_GROUND_GRASP, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Queue the sit toggle, likewise.
     pub fn request_sit_toggle(&self) {
         self.skills
@@ -383,6 +392,7 @@ impl Intents {
         let bits = self.skills.swap(0, std::sync::atomic::Ordering::Relaxed);
         SkillRequests {
             ground_pick: bits & SKILL_GROUND_PICK != 0,
+            ground_grasp: bits & SKILL_GROUND_GRASP != 0,
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
             skills: bits >> SKILL_BITS,
         }

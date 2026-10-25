@@ -211,6 +211,8 @@ pub enum Net {
     SitStand,
     /// Phase-scripted ground pick; the twist slots carry `[cos φ, sin φ, 0]`.
     GroundPick,
+    /// The second pick: the same phase command, on its own network.
+    GroundGrasp,
     /// A one-shot skill, by its index in [`PolicyPaths::skills`].
     ///
     /// Kicks and roulade used to be variants here. They were the same thing three times over —
@@ -228,6 +230,7 @@ pub struct PolicyPaths {
     pub stand: Option<PathBuf>,
     pub sitstand: Option<PathBuf>,
     pub ground_pick: Option<PathBuf>,
+    pub ground_grasp: Option<PathBuf>,
     /// One-shot skills, in the priority order the caller wants them considered. Each is
     /// selected only by an explicit request, so an empty list is a robot with no tricks rather
     /// than a robot missing something.
@@ -244,6 +247,7 @@ pub struct Policy {
     stand: Option<Network>,
     sitstand: Option<Network>,
     ground_pick: Option<Network>,
+    ground_grasp: Option<Network>,
     skills: Vec<Network>,
     standing_threshold: f64,
     active: Option<Net>,
@@ -287,6 +291,7 @@ impl Policy {
                 stand: open_opt(&paths.stand, &zero)?,
                 sitstand: open_opt(&paths.sitstand, &zero)?,
                 ground_pick: open_opt(&paths.ground_pick, &zero)?,
+                ground_grasp: open_opt(&paths.ground_grasp, &zero)?,
                 skills: paths
                     .skills
                     .iter()
@@ -327,6 +332,10 @@ impl Policy {
         self.ground_pick.is_some()
     }
 
+    pub fn has_ground_grasp(&self) -> bool {
+        self.ground_grasp.is_some()
+    }
+
     /// How many one-shot skills are loaded. A caller's index is valid below this.
     pub fn skill_count(&self) -> usize {
         self.skills.len()
@@ -346,6 +355,7 @@ impl Policy {
             Net::Stand if self.stand.is_none() => Net::Walk,
             Net::SitStand if self.sitstand.is_none() => Net::Walk,
             Net::GroundPick if self.ground_pick.is_none() => Net::Walk,
+            Net::GroundGrasp if self.ground_grasp.is_none() => Net::Walk,
             Net::Skill(i) if i >= self.skills.len() => Net::Walk,
             net => net,
         };
@@ -355,6 +365,7 @@ impl Policy {
             Net::Stand => self.stand.as_mut().unwrap(),
             Net::SitStand => self.sitstand.as_mut().unwrap(),
             Net::GroundPick => self.ground_pick.as_mut().unwrap(),
+            Net::GroundGrasp => self.ground_grasp.as_mut().unwrap(),
             Net::Skill(i) => &mut self.skills[i],
         };
         if changed {
@@ -384,6 +395,7 @@ impl Policy {
             Net::Stand => self.stand.as_mut(),
             Net::SitStand => self.sitstand.as_mut(),
             Net::GroundPick => self.ground_pick.as_mut(),
+            Net::GroundGrasp => self.ground_grasp.as_mut(),
             Net::Skill(i) => self.skills.get_mut(i),
         };
         let source = match net {
@@ -391,6 +403,7 @@ impl Policy {
             Net::Stand => from.stand.as_ref(),
             Net::SitStand => from.sitstand.as_ref(),
             Net::GroundPick => from.ground_pick.as_ref(),
+            Net::GroundGrasp => from.ground_grasp.as_ref(),
             Net::Skill(i) => from.skills.get(i),
         };
         if let (Some(target), Some(source)) = (target, source)
@@ -422,6 +435,7 @@ impl Policy {
             .iter_mut()
             .chain(self.sitstand.iter_mut())
             .chain(self.ground_pick.iter_mut())
+            .chain(self.ground_grasp.iter_mut())
             .chain(self.skills.iter_mut())
         {
             network.reset();

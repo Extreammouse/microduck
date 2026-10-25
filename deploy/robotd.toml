@@ -185,6 +185,13 @@ mode = "walk"
 # ground_pick_period = 4.0
 # ground_pick_action_scale = 1.0
 # ground_pick_gain_ratio = 1.0
+# A second pick, `robot.do ground_grasp`: the ground pick's cycle on a network trained to close the
+# beak on what it reaches. robotd plays that beak on the pick's own phase, open to ground_grasp_mouth
+# (robot.mouth units; 0.88 is the trained 26°) over 2-10% of the cycle, closed on the object over the
+# 6% from ground_grasp_mouth_close. Walking only; unset, the robot has no grasp.
+# ground_grasp = "/var/lib/robot/policies/ground_grasp.onnx"
+# ground_grasp_mouth = 0.88
+# ground_grasp_mouth_close = 0.30
 
 # How long a kick window stays on the kick network, seconds.
 # kick_duration = 0.5

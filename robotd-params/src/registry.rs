@@ -186,6 +186,11 @@ pub const REGISTRY: &[Entry] = &[
         Kind::OptionalPath,
         "Ground-pick policy (roller: the crouch)",
     ),
+    entry(
+        "policy.ground_grasp",
+        Kind::OptionalPath,
+        "Second pick, with a trained beak (robot.do ground_grasp); unset = none",
+    ),
     entry("policy.kick_left", Kind::OptionalPath, "Left-kick policy"),
     entry("policy.kick_right", Kind::OptionalPath, "Right-kick policy"),
     entry("policy.roulade", Kind::OptionalPath, "Forward-roll policy"),
@@ -233,6 +238,16 @@ pub const REGISTRY: &[Entry] = &[
         "policy.ground_pick_gain_ratio",
         Kind::Float,
         "Gain multiplier during the ground pick",
+    ),
+    entry(
+        "policy.ground_grasp_mouth",
+        Kind::Float,
+        "Beak opening the ground grasp plays on its phase",
+    ),
+    entry(
+        "policy.ground_grasp_mouth_close",
+        Kind::Float,
+        "Pick phase at which that beak starts closing",
     ),
     feature(
         "policy.voltage_adapt",

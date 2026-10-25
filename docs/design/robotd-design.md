@@ -473,6 +473,14 @@ itself when it chains, which is the button being held. This is a second divergen
 prototype let a pick preempt a kick's tail and a roulade roll out of a kick or the seat, each a
 network handed a pose it was not trained from.
 
+**The mouth follows the intent, except under the ground grasp.** No network drives the mouth, but
+`[policy] ground_grasp` is a second pick — the ground pick's phase, cycle and tuning on its own
+network — trained with a scripted beak, so while it drives the loop writes that schedule in place
+of `robot.mouth`: open to `ground_grasp_mouth` over phase 0.02–0.10, closed on the object over the
+0.06 from `ground_grasp_mouth_close`. It is keyed on the controller's own phase because a client's
+clock starts at the button press, and the grasp can be refused. The theremin and the chorale still
+come first.
+
 The seat survives a deliberate stop and nothing else. Disabling the policy ends the move in
 flight and, on a seated robot, holds the seat where it is rather than sending the standing home
 pose, which a sitting robot can only reach by going over backwards; `robot.init` on a seated

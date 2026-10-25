@@ -355,6 +355,7 @@ struct PolicyNames {
     stand: Option<String>,
     sitstand: Option<String>,
     ground_pick: Option<String>,
+    ground_grasp: Option<String>,
     /// The configurable one-shots this robot has, in priority order — the names a client may
     /// ask for, and the answer to "what can this robot do".
     skills: Vec<String>,
@@ -372,6 +373,7 @@ impl PolicyNames {
             stand: name(&policy.stand),
             sitstand: name(&policy.sitstand),
             ground_pick: name(&policy.ground_pick),
+            ground_grasp: name(&policy.ground_grasp),
             skills: policy.skills.iter().map(|s| s.name.clone()).collect(),
         }
     }
@@ -1879,6 +1881,7 @@ fn change_disturbs(
         Driving::SitStand => before.sitstand != after.sitstand,
         Driving::Seated => false,
         Driving::GroundPick => before.ground_pick != after.ground_pick,
+        Driving::GroundGrasp => before.ground_grasp != after.ground_grasp,
         Driving::Skill(_) => before.skills != after.skills,
     }
 }
@@ -1954,6 +1957,8 @@ fn try_controller(
             ground_pick_end_phase: policy_cfg.ground_pick_end_phase,
             ground_pick_action_scale: policy_cfg.ground_pick_action_scale,
             ground_pick_gain_ratio: policy_cfg.ground_pick_gain_ratio,
+            ground_grasp_mouth: policy_cfg.ground_grasp_mouth,
+            ground_grasp_mouth_close: policy_cfg.ground_grasp_mouth_close,
             sitstand_rise_s: policy_cfg.sitstand_rise_s,
             sitstand_ramp_s: policy_cfg.sitstand_ramp_s,
             skills: policy_cfg.skills.clone(),
@@ -1963,6 +1968,7 @@ fn try_controller(
             stand: policy_cfg.stand.clone(),
             sitstand: policy_cfg.sitstand.clone(),
             ground_pick: policy_cfg.ground_pick.clone(),
+            ground_grasp: policy_cfg.ground_grasp.clone(),
             // Only the skills whose file resolves — a slot switched off with `"none"` is
             // already filtered out by `resolved_skills`.
             skills: policy_cfg
@@ -1985,6 +1991,7 @@ fn try_controller(
                     stand = ?policy_cfg.stand.as_ref().map(|p| p.display().to_string()),
                     sitstand = ?policy_cfg.sitstand.as_ref().map(|p| p.display().to_string()),
                     ground_pick = ?policy_cfg.ground_pick.as_ref().map(|p| p.display().to_string()),
+                    ground_grasp = ?policy_cfg.ground_grasp.as_ref().map(|p| p.display().to_string()),
                     kicks = policy_cfg.kick_left.is_some() || policy_cfg.kick_right.is_some(),
                     roulade = ?policy_cfg.roulade.as_ref().map(|p| p.display().to_string()),
                     limp_fall,
@@ -2572,6 +2579,9 @@ async fn control_loop<T: RobotIo>(
                     };
                     if requests.ground_pick {
                         outcome("ground_pick", controller.start_ground_pick());
+                    }
+                    if requests.ground_grasp {
+                        outcome("ground_grasp", controller.start_ground_grasp());
                     }
                     if requests.sit_toggle {
                         match controller.sit_toggle() {
@@ -3846,14 +3856,18 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
-        // The mouth is not part of any policy; the intent, and the idle yawn, are what move it.
+        // The mouth is not part of any policy; the intent, and the idle yawn, are what move it —
+        // except under the ground grasp, which plays the beak it was trained with.
         // Only while driving — a held or homing robot keeps whatever its hold pose says, so
         // a restart cannot snap a mouth.
         // An idle yawn opens it further than a client asked, never less: the yawn only runs
         // while nothing asks the robot to move, and a client holding the beak open keeps it so.
         if driving && theremin_state.is_none() && chorale_state.is_none() {
-            targets[duck_control::model::MOUTH_INDEX] =
-                duck_control::model::mouth_target(snapshot.mouth.max(idle.mouth));
+            let mouth = controller
+                .as_ref()
+                .and_then(Controller::ground_grasp_mouth)
+                .unwrap_or(snapshot.mouth.max(idle.mouth));
+            targets[duck_control::model::MOUTH_INDEX] = duck_control::model::mouth_target(mouth);
         }
 
         // The next feature row pairs its reading with this command.
@@ -4688,12 +4702,13 @@ fn skills_report(state: &RobotState) -> proto::SkillsResult {
                 overridden: overridden.contains(&skill.name),
             })
             .collect(),
-        built_in: ["ground_pick", "sit_toggle"]
+        built_in: ["ground_pick", "ground_grasp", "sit_toggle"]
             .into_iter()
             .filter(|name| {
                 names.skills.iter().all(|s| s != name)
                     && match *name {
                         "ground_pick" => names.ground_pick.is_some(),
+                        "ground_grasp" => names.ground_grasp.is_some(),
                         _ => names.sitstand.is_some(),
                     }
             })
@@ -5123,6 +5138,9 @@ fn do_names(policies: &PolicyNames, emotions: &emotion::Library) -> Vec<String> 
     if policies.ground_pick.is_some() {
         names.push("ground_pick".to_owned());
     }
+    if policies.ground_grasp.is_some() {
+        names.push("ground_grasp".to_owned());
+    }
     if policies.sitstand.is_some() {
         names.push("sit_toggle".to_owned());
     }
@@ -5136,6 +5154,10 @@ fn queue_skill(state: &RobotState, intents: &Intents, skill: &str) -> bool {
     match skill {
         "ground_pick" if policies.ground_pick.is_some() => {
             intents.request_ground_pick();
+            true
+        }
+        "ground_grasp" if policies.ground_grasp.is_some() => {
+            intents.request_ground_grasp();
             true
         }
         "sit_toggle" if policies.sitstand.is_some() => {
@@ -6048,6 +6070,22 @@ mod tests {
             &emotion::Library::default(),
         );
         assert_eq!(without, ["roulade"]);
+    }
+
+    /// The ground grasp answers to its name only on a robot whose `[policy] ground_grasp` loaded,
+    /// right after the plain pick it shares a cycle with.
+    #[test]
+    fn the_ground_grasp_is_a_skill_when_its_policy_is_loaded() {
+        let names = do_names(
+            &PolicyNames {
+                ground_pick: Some("alpha_ground_pick.onnx".to_owned()),
+                ground_grasp: Some("ground_grasp.onnx".to_owned()),
+                sitstand: Some("alpha_sitstand.onnx".to_owned()),
+                ..Default::default()
+            },
+            &emotion::Library::default(),
+        );
+        assert_eq!(names, ["ground_pick", "ground_grasp", "sit_toggle"]);
     }
 
     /// **An unknown skill is refused with the list, before anything is written.**
