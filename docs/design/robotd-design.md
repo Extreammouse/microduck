@@ -866,7 +866,7 @@ control mid-stride is how a robot falls over (`updater-design.md` §7.2).
 
 ### 3.5 Maintenance is a separate namespace
 
-The proposed inspection and bounded actuator-test sessions are specified in
+The proposed inspection and raw maintenance sessions are specified in
 [`diagnostics-design.md`](diagnostics-design.md); they are not implemented.
 
 `init`, emergency torque-off, calibration and raw joint writes are not intents. They live in their
