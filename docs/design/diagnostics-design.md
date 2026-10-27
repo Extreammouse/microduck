@@ -7,7 +7,7 @@ its API and records. The existing control loop and bus belong to
 
 ## 1. Problem and scope
 
-An operator sees asymmetric leg motion and wants to compare the left and right knees while
+An operator wants to inspect or exercise any of the robot's 15 motors independently while
 the robot is mechanically supported in front of an external camera. Today, inspecting joint
 telemetry works, but `robot.init` moves all joints and skills replace the ordinary controller.
 Neither is an isolated actuator test. A separate serial script would fight robotd for its bus.
@@ -17,7 +17,7 @@ engine: inspect first, preview a finite experiment, acquire exclusive authority,
 on-board bounds, and export enough evidence to explain the result. The same path should support
 inspection and individual testing of **all 15 motors**, including the mouth, replacement
 commissioning and later calibration reference measurements. All-motor coverage is a release
-requirement, not an optional extension after the knee example works.
+requirement. No motor has a privileged API, implementation path or commissioning order.
 It must not infer calibration from walking asymmetry or silently alter the robot to make a test pass.
 
 ### Evidence behind this proposal
@@ -309,7 +309,7 @@ Common machine-readable reasons: `unauthorized`, `controller_active`, `diagnosti
 observed value, allowed bound and observation age when applicable; do not collapse these to
 `accepted:false` with no reason.
 
-### Example: preview a small left-knee experiment
+### Example: preview a single-joint experiment
 
 The numeric values illustrate the wire shape, **not an approved physical envelope**. Capabilities
 must advertise a validated profile before acquisition. An unvalidated profile returns its blocker.
@@ -321,7 +321,7 @@ must advertise a validated profile before acquisition. An unvalidated profile re
     "session_id": "session-opaque", "token": "connection-bound",
     "request_id": "prepare-1",
     "experiment": {
-      "kind": "approach_hold_return", "joint": "left_knee",
+      "kind": "approach_hold_return", "joint": "left_hip_roll",
       "delta_rad": 0.05, "hold_s": 0.3, "repeats": 1
     },
     "limits": {"max_velocity_rad_s": 0.1, "max_duration_s": 3.0}
@@ -331,6 +331,8 @@ must advertise a validated profile before acquisition. An unvalidated profile re
 
 Initial position is taken by the server at preparation, then rechecked at run. Changes beyond
 the profile tolerance invalidate the plan; never silently rebase the same digest to a new pose.
+The joint name in this example is arbitrary: the same schema, state machine and qualification
+rules apply to every inventory entry, including the mouth. Differences belong in profile data.
 A local preview command may compute an unready plan without acquiring or arming; it carries
 `executable:false` and cannot be supplied to run. No arbitrary arrays of raw Dynamixel counts.
 
@@ -340,10 +342,10 @@ One `robotctl diagnose` command group, backed by the same typed RPC methods:
 
 ```text
 robotctl diagnose inspect --json
-robotctl diagnose watch --joint left_knee
-robotctl diagnose record --duration 15 --label passive-knees
-robotctl diagnose preview --profile supported_supine_v1 --joint left_knee --delta-deg 3
-robotctl diagnose test --profile supported_supine_v1 --joint left_knee --delta-deg 3
+robotctl diagnose watch --joint left_hip_roll
+robotctl diagnose record --duration 15 --label passive-joints
+robotctl diagnose preview --profile supported_supine_v1 --joint left_hip_roll --delta-deg 3
+robotctl diagnose test --profile supported_supine_v1 --joint left_hip_roll --delta-deg 3
 robotctl diagnose stop
 robotctl diagnose report <run-id>
 ```
@@ -424,7 +426,7 @@ or permanent calibration history in its capped event list. Reports never overwri
 ## 7. Calibration is a separate transaction
 
 V1 diagnostics never writes EEPROM, changes homing, adopts replacements, reboots motors or
-alters DEFAULT_POSITION. Expected knee homing remains -512 on IDs 13/23, zero elsewhere;
+alters DEFAULT_POSITION. Expected homing values remain those of the existing motor model;
 startup enforcement remains the owner of the current convention. Expose startup preimages so
 a repaired register is observable. The test mode itself must not call the correcting startup
 function as an inspection shortcut.
@@ -448,7 +450,7 @@ generations so a replaced servo does not inherit an old physical measurement aut
 | 1. Honest inspection | Cached motor/register snapshots, startup preimages, desired versus readback, effective pickup applicability, bounded refresh, passive export | `duck-control/src/{io,bus}.rs`, `robotd/src/{main,diagnostics,pickup}.rs`, `duck-ipc-proto/src/{lib,diagnostics}.rs`, `robotctl/src/diagnostics.rs` |
 | 2. Offline session engine | Lease/authority state machine, trajectory preview, fault-stop specification and recorder tested with FakeIo; capabilities explicitly refuse unvalidated hardware motion | Same modules; `duck-control/src/diagnostics.rs`; fake/simulation backends |
 | 3. Protection commissioning | Qualified supported fixture/profile, selective torque/readback, host-loss watchdog, support/lift detection and measured stop latency; no profile available without evidence | `duck-control/src/{safety,pickup,bus,model}.rs`, `robotd/src/pickup.rs`, versioned profile data and commissioning record |
-| 4. Individual motor tests | Commission one knee first, then qualify profiles and individual approach/hold/return for all 15 motors, including neck/head and mouth; local robotctl hold-to-run, USB capture, complete report and no unintended joint activation. A knee-only implementation does not complete this slice. | Diagnostic API/CLI plus focused laptop recorder script; transport exclusion tests; per-joint profile data |
+| 4. Individual motor tests | Qualify profiles and individual approach/hold/return for all 15 motors through the same implementation and acceptance criteria; local robotctl hold-to-run, USB capture, complete report and no unintended joint activation. No named joint is a prerequisite for the others. | Diagnostic API/CLI plus focused laptop recorder script; transport exclusion tests; per-joint profile data |
 | 5. Comparative tools | Bidirectional sweep, sequential mirrored comparisons, external-reference attachment and report diff | Same API experiment enum and offline reporting; no new execution framework |
 
 Add diagnostic parameters to `robotd-params` only for resource bounds/approved profiles, with
@@ -485,8 +487,9 @@ an unvalidated profile is reported as blocked, never counted as successful all-m
 
 Simulator validation checks target generation and collisions against the selected model,
 but cannot qualify real fixture support, backlash, friction, current thresholds or pickup.
-Physical commissioning starts with a dummy fixture/one unloaded joint, independent stop means
-and a supervising person. Measure worst-case cancel/lease/host-loss latency, actual torque state,
+Physical commissioning uses a dummy fixture, unloaded individual-motor tests, independent stop
+means and a supervising person. Apply the same qualification protocol to all 15 motors; order
+is chosen for the available setup, not prescribed by joint name. Measure worst-case cancel/lease/host-loss latency, actual torque state,
 remaining travel, current/temperature behaviour and release under the fixture. Test lift/support
 loss in slow and fast cases, model absence/error and posture outside the validation set. State
 numeric acceptance thresholds in the profile *before* enabling it; they are not chosen from
@@ -506,6 +509,6 @@ changes. Only validated profiles ship as motorized capabilities.
 5. Keep persistent calibration writes and arbitrary trajectory/policy experiments outside v1.
 
 These are deliberate scope boundaries. The smallest useful first change is honest inspection
-and a replayable report for all 15 motors. Commissioning starts with one isolated knee, then
-must extend to qualified individual tests for all 15 motors; that first knee is not the finished
-feature. General raw actuation and calibration writes remain outside the scope.
+and a replayable report for all 15 motors, followed by qualified individual tests using the same
+execution and validation path for every motor. General raw actuation and calibration writes
+remain outside the scope.
