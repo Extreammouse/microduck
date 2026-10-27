@@ -236,6 +236,10 @@ pub struct FakeIo {
     pub diagnostic_goals: [f64; NUM_JOINTS],
     pub diagnostic_writes: Vec<u8>,
     pub diagnostic_fail_id: Option<u8>,
+    pub diagnostic_fail_after_reads: Option<usize>,
+    pub diagnostic_reads: usize,
+    /// Normal goal/gain/torque writes and last normal P gain, shared with integration tests.
+    pub normal_write_counts: std::sync::Arc<[std::sync::atomic::AtomicUsize; 4]>,
 
     sensors: Sensors,
     /// Set to make the next [`RobotIo::read`] fail, then cleared. For exercising the
@@ -289,6 +293,11 @@ impl FakeIo {
             diagnostic_goals: [0.0; NUM_JOINTS],
             diagnostic_writes: vec![],
             diagnostic_fail_id: None,
+            diagnostic_fail_after_reads: None,
+            diagnostic_reads: 0,
+            normal_write_counts: std::sync::Arc::new(std::array::from_fn(|_| {
+                std::sync::atomic::AtomicUsize::new(0)
+            })),
             fail_reads: 0,
             last_written: None,
             reads: 0,
@@ -357,6 +366,13 @@ impl FakeIo {
 
 impl RobotIo for FakeIo {
     fn diagnostic_read(&mut self, id: u8) -> Result<crate::diagnostics::Motor> {
+        if self
+            .diagnostic_fail_after_reads
+            .is_some_and(|n| self.diagnostic_reads >= n)
+        {
+            return Err(IoError::Simulated);
+        }
+        self.diagnostic_reads += 1;
         if self.diagnostic_fail_id == Some(id) {
             return Err(IoError::Simulated);
         }
@@ -426,6 +442,8 @@ impl RobotIo for FakeIo {
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        self.normal_write_counts[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.diagnostic_goals = targets.positions;
         self.writes += 1;
         self.last_written = Some(*targets);
         if self.track_targets {
@@ -435,11 +453,16 @@ impl RobotIo for FakeIo {
     }
 
     fn set_gain(&mut self, kp: u16) -> Result<()> {
+        self.normal_write_counts[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.normal_write_counts[3].store(kp as usize, std::sync::atomic::Ordering::Relaxed);
+        self.diagnostic_pids
+            .fill(crate::diagnostics::Pid { p: kp, i: 0, d: 0 });
         self.last_gain = Some(kp);
         Ok(())
     }
 
     fn set_torque(&mut self, on: bool) -> Result<()> {
+        self.normal_write_counts[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.torque = Some(on);
         self.diagnostic_torques.fill(on);
         self.torque_writes += 1;

@@ -237,7 +237,9 @@ pub fn run(path: &Path, command: Command) -> Result<(), Failure> {
     let mut rid = 1;
     let mut sequence = 0;
     let mut last = Instant::now();
-    let result = (|| {
+
+    // On I/O failure dropping the connection triggers server-side termination; no detached heartbeat.
+    (|| {
         loop {
             if INTERRUPTED.load(Ordering::Relaxed) {
                 break;
@@ -282,9 +284,7 @@ pub fn run(path: &Path, command: Command) -> Result<(), Failure> {
         }))?;
         output(&v)?;
         accepted(&v)
-    })();
-    // On I/O failure dropping the connection triggers server-side termination; no detached heartbeat.
-    result
+    })()
 }
 #[cfg(test)]
 mod tests {

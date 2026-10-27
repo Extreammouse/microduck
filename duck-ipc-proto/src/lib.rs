@@ -470,6 +470,10 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// laser sweep, nearest object — merged into the vet book by `robotd`, which owns it. The book
 /// gains three maps for them ([`vetbook::Life::tallies`], `highs`, `lows`), additive: an older
 /// book loads with them empty. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
+/// # v45 — local raw maintenance for all fifteen motors
+///
+/// Typed robot.diagnostics methods, connection-bound ownership and the optional maintenance
+/// block on robot.state. Install the complete daemon release, including robotctl and route tables.
 pub const API_VERSION: u32 = 45;
 
 /// The observation width every policy this robot family runs is built against.
@@ -1801,7 +1805,7 @@ impl Call {
 pub mod test_support {
     use super::*;
 
-    /// One of every [`Call`] variant, so a test cannot silently skip one.
+    /// One of every public method, including each diagnostic sub-operation.
     ///
     /// The exhaustive matches over [`Call`] — `method`, `destination`, and each transport's
     /// permission table — are what force this list to stay complete: a new variant breaks those
@@ -1810,6 +1814,52 @@ pub mod test_support {
         let component = ComponentId::new("daemon");
         let version = semver::Version::new(1, 4, 2);
         vec![
+            Call::RobotDiagnostics(diagnostics::Call::Capabilities),
+            Call::RobotDiagnostics(diagnostics::Call::Inspect),
+            Call::RobotDiagnostics(diagnostics::Call::Status),
+            Call::RobotDiagnostics(diagnostics::Call::Refresh(diagnostics::Cancel {
+                request_id: 1,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Acquire(diagnostics::Acquire {
+                request_id: 1,
+                mode: "maintenance_raw".into(),
+                acknowledge_raw: true,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Torque(diagnostics::Torque {
+                session_id: 1,
+                request_id: 2,
+                joints: vec!["mouth".into()],
+                on: true,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Gains(diagnostics::Gains {
+                session_id: 1,
+                request_id: 3,
+                gains: std::collections::BTreeMap::from([(
+                    "mouth".into(),
+                    diagnostics::Pid { p: 100, i: 0, d: 0 },
+                )]),
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Command(diagnostics::Command {
+                session_id: 1,
+                request_id: 4,
+                positions_rad: std::collections::BTreeMap::from([("mouth".into(), 0.0)]),
+                valid_for_ms: 100,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Keepalive(diagnostics::Keepalive {
+                session_id: 1,
+                sequence: 1,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Stop(diagnostics::Session {
+                session_id: 1,
+                request_id: 5,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Release(diagnostics::Session {
+                session_id: 1,
+                request_id: 6,
+            })),
+            Call::RobotDiagnostics(diagnostics::Call::Cancel(diagnostics::Cancel {
+                request_id: 1,
+            })),
             Call::Hello(HelloParams {
                 api_version: API_VERSION,
             }),
@@ -5840,7 +5890,7 @@ mod tests {
     fn every_call_covers_every_variant() {
         assert_eq!(
             every_call().len(),
-            73,
+            85,
             "a Call variant was added or removed — update every_call() and this count"
         );
     }
@@ -6037,6 +6087,14 @@ mod tests {
         assert_eq!(
             mutating,
             vec![
+                "robot.diagnostics.acquire",
+                "robot.diagnostics.torque",
+                "robot.diagnostics.gains",
+                "robot.diagnostics.command",
+                "robot.diagnostics.keepalive",
+                "robot.diagnostics.stop",
+                "robot.diagnostics.release",
+                "robot.diagnostics.cancel",
                 method::APPLY,
                 method::ROLLBACK,
                 method::RESET_TO_GOLDEN,

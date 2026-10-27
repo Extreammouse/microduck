@@ -185,6 +185,11 @@ pub struct Reply {
     pub reason: Option<String>,
     pub session_id: Option<u64>,
     pub sequence: u64,
+    pub committed_at_ns: u64,
+    pub commit_tick: u64,
+    pub lease_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Vec<Motor>>,
     pub outcomes: Vec<Outcome>,
 }
 impl Reply {
@@ -194,6 +199,10 @@ impl Reply {
             reason: Some(reason.into()),
             session_id: None,
             sequence: 0,
+            committed_at_ns: 0,
+            commit_tick: 0,
+            lease_ms: 0,
+            snapshot: None,
             outcomes: vec![],
         }
     }
@@ -207,7 +216,7 @@ pub struct Status {
     pub stop_unconfirmed: Vec<String>,
     pub motors: Vec<Motor>,
     pub last_reply: Option<Reply>,
-    pub pickup_enforced: bool,
+    pub pickup_enforced: Option<bool>,
     pub snapshot_at_ns: u64,
     pub command_deadlines_ms: BTreeMap<String, u64>,
     pub sent_targets_rad: BTreeMap<String, f64>,

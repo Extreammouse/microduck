@@ -2444,17 +2444,21 @@ async fn control_loop<T: RobotIo>(
         state.fallen.store(safety.fallen(), Ordering::Relaxed);
 
         let idle_for_maintenance = intents.maintenance_idle()
-            && !matches!(bringup, Bringup::Homing { .. })
+            && bringup == Bringup::Limp
             && controller
                 .as_ref()
                 .is_none_or(|c| !c.busy() && !c.is_sitting())
             && shutdown_sit.is_none()
             && shutdown_rest.is_none()
             && pending_swap.is_none()
-            && !powered_off;
+            && !powered_off
+            && !maintenance_exit_pending;
         let maintenance_ended = maintenance.tick(&mut safety, tick_start, idle_for_maintenance);
         if maintenance_ended {
             maintenance_exit_pending = true;
+        }
+        if maintenance_exit_pending {
+            state.diagnostics.blocked.store(true, Ordering::Release);
         }
         if maintenance_exit_pending && fresh.is_some() {
             maintenance_exit_pending = false;
@@ -2468,6 +2472,16 @@ async fn control_loop<T: RobotIo>(
                 hold = f.positions;
             }
             safety.invalidate_gain();
+            // Off was confirmed: clear stale native goals before allowing a new init/enable.
+            // Keep the admission gate closed until this restoration finishes successfully.
+            if let Err(e) = safety.apply(hold, hold, policy_cfg.gain) {
+                tracing::warn!(error=%e,"maintenance exit restore failed; keeping writes inhibited");
+                maintenance_exit_pending = true;
+            }
+            state.diagnostics.blocked.store(
+                maintenance.blocked() || maintenance_exit_pending,
+                Ordering::Release,
+            );
         }
         if maintenance.blocked() || maintenance_exit_pending {
             intents.clear_maintenance_intents();
@@ -4586,14 +4600,15 @@ async fn handle(
                         .unwrap()
                 }
                 _ => {
+                    tracing::info!(method=operation.method(),connection=connection.id,uid=?peer_uid,"maintenance request");
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let pending = diagnostics::Pending {
                         connection: connection.id,
                         call: operation.clone(),
                         reply: tx,
                     };
-                    let reply = if state.diagnostics.enqueue(pending).is_err() {
-                        proto::diagnostics::Reply::refused("busy")
+                    let reply = if let Err(reason) = state.diagnostics.enqueue(pending) {
+                        proto::diagnostics::Reply::refused(reason)
                     } else {
                         match tokio::time::timeout(Duration::from_secs(5), rx).await {
                             Ok(Ok(v)) => v,
@@ -10166,8 +10181,11 @@ mod tests {
         ));
         let intents = Arc::new(Intents::new());
         let mut frames = state.state_tx.subscribe();
+        let io = FakeIo::new();
+        let counters = io.normal_write_counts.clone();
+        let expected_gain = params.policy.resolved().gain as usize;
         let loop_task = tokio::spawn(control_loop(
-            FakeIo::new(),
+            io,
             state.clone(),
             intents.clone(),
             params,
@@ -10203,6 +10221,13 @@ mod tests {
         assert!(acquired.accepted, "{acquired:?}");
         let sid = acquired.session_id.unwrap();
         assert!(!state.safe_to_restart().safe);
+        state.fallen.store(true, Ordering::Relaxed);
+        assert!(!state.safe_to_restart().safe);
+        let before: Vec<_> = counters
+            .iter()
+            .take(3)
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
         let r = rpc(
             &mut client,
             proto::Call::RobotEnable(proto::EnableParams {
@@ -10251,17 +10276,60 @@ mod tests {
         .unwrap();
         assert_eq!(frame.policy, "maintenance_raw");
         assert_eq!(frame.targets.len(), 15);
-        assert!(!frame.maintenance.unwrap().pickup_enforced);
+        assert_eq!(frame.maintenance.unwrap().pickup_enforced, Some(false));
+        for (i, value) in before.iter().enumerate() {
+            assert_eq!(
+                counters[i].load(Ordering::Relaxed),
+                *value,
+                "normal write during raw ownership"
+            );
+        }
         drop(client);
         server_task.await.unwrap().unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(state.diagnostics.status.load().session_id.is_none());
         assert!(!intents.enabled());
+        assert!(counters[0].load(Ordering::Relaxed) > before[0]);
+        assert_eq!(counters[3].load(Ordering::Relaxed), expected_gain);
         assert_eq!(
             state.diagnostics.status.load().motors[9].torque,
             Some(false)
         );
         state.shutdown.store(true, Ordering::Relaxed);
         loop_task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn relay_identity_is_denied_at_the_actual_socket_handler() {
+        let params = Params::default();
+        let mut value = RobotState::new(&params, Path::new("/nonexistent"), false, false);
+        value.relay_uids = vec![unsafe { libc::geteuid() }];
+        let state = Arc::new(value);
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle(state.clone(), Arc::new(Intents::new()), server));
+        let mut reader = BufReader::new(client);
+        let call = proto::Call::RobotDiagnostics(proto::diagnostics::Call::Acquire(
+            proto::diagnostics::Acquire {
+                request_id: 1,
+                mode: "maintenance_raw".into(),
+                acknowledge_raw: true,
+            },
+        ));
+        let request = serde_json::to_string(&proto::Request::call(proto::Id::Number(1), &call))
+            .unwrap()
+            + "\n";
+        reader
+            .get_mut()
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: proto::Response = serde_json::from_str(&line).unwrap();
+        let r: proto::diagnostics::Reply = response.result_as().unwrap();
+        assert_eq!(r.reason.as_deref(), Some("unauthorized"));
+        assert_eq!(state.diagnostics.tx.capacity(), 16);
+        assert!(!state.diagnostics.blocked.load(Ordering::Acquire));
+        drop(reader);
+        task.await.unwrap().unwrap();
     }
 }

@@ -32,6 +32,7 @@ pub struct Shared {
     priority: Mutex<Option<Pending>>,
     rx: Mutex<Option<mpsc::Receiver<Pending>>>,
     next_connection: AtomicU64,
+    refresh_at_ns: AtomicU64,
 }
 impl Shared {
     pub fn new() -> Self {
@@ -46,6 +47,7 @@ impl Shared {
             priority: Mutex::new(None),
             rx: Mutex::new(Some(rx)),
             next_connection: AtomicU64::new(1),
+            refresh_at_ns: AtomicU64::new(0),
         }
     }
     pub fn connection(self: &Arc<Self>) -> Connection {
@@ -54,16 +56,32 @@ impl Shared {
             id: self.next_connection.fetch_add(1, Ordering::Relaxed),
         }
     }
-    pub fn enqueue(&self, p: Pending) -> Result<(), ()> {
-        if matches!(p.call, d::Call::Stop(_) | d::Call::Cancel(_)) {
-            let mut slot = self.priority.lock().map_err(|_| ())?;
+    pub fn enqueue(&self, p: Pending) -> Result<(), &'static str> {
+        if matches!(p.call, d::Call::Refresh(_))
+            && !self.admit_refresh(duck_ipc_proto::clock::monotonic_ns())
+        {
+            return Err("rate_limited");
+        }
+        if matches!(
+            p.call,
+            d::Call::Stop(_) | d::Call::Release(_) | d::Call::Cancel(_)
+        ) {
+            let mut slot = self.priority.lock().map_err(|_| "busy")?;
             if let Some(old) = slot.replace(p) {
                 let _ = old.reply.send(d::Reply::refused("superseded_stop"));
             }
             Ok(())
         } else {
-            self.tx.try_send(p).map_err(|_| ())
+            self.tx.try_send(p).map_err(|_| "busy")
         }
+    }
+    fn admit_refresh(&self, now: u64) -> bool {
+        let previous = self.refresh_at_ns.load(Ordering::Acquire);
+        now.saturating_sub(previous) >= 1_000_000_000
+            && self
+                .refresh_at_ns
+                .compare_exchange(previous, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
     }
     pub fn receiver(&self) -> mpsc::Receiver<Pending> {
         self.rx.lock().unwrap().take().expect("one control owner")
@@ -88,6 +106,7 @@ struct Session {
     high: u64,
     cache: VecDeque<(u64, d::Call, d::Reply)>,
     acquire_request: d::Acquire,
+    acquire_reply: Option<d::Reply>,
 }
 pub struct Controller {
     rx: mpsc::Receiver<Pending>,
@@ -100,9 +119,11 @@ pub struct Controller {
     deadlines: [Option<Instant>; NUM_JOINTS],
     generation: u64,
     sequence: u64,
+    tick_sequence: u64,
     last: Option<d::Reply>,
     sent_targets: std::collections::BTreeMap<String, f64>,
     last_command: Option<d::Command>,
+    terminal: Option<(u64, d::Call, d::Reply)>,
     shared: Arc<Shared>,
     last_refresh: Instant,
     refresh_remaining: usize,
@@ -124,9 +145,11 @@ impl Controller {
             deadlines: [None; NUM_JOINTS],
             generation: 0,
             sequence: 0,
+            tick_sequence: 0,
             last: None,
             sent_targets: Default::default(),
             last_command: None,
+            terminal: None,
             last_refresh: Instant::now() - Duration::from_secs(2),
             refresh_remaining: NUM_JOINTS,
         }
@@ -142,6 +165,7 @@ impl Controller {
             }
             Err(e) => {
                 let mut m = duck_control::diagnostics::empty_motor(JOINT_IDS[i]).unwrap();
+                m.before_startup_fix = self.motors[i].before_startup_fix;
                 m.error = Some(e.to_string());
                 m.observed_at_ns = duck_ipc_proto::clock::monotonic_ns();
                 self.motors[i] = m;
@@ -152,6 +176,7 @@ impl Controller {
         indices
             .iter()
             .map(|&i| {
+                self.deadlines[i] = None;
                 let write = s.diagnostic_torque(JOINT_IDS[i], false);
                 self.read(s, i);
                 let confirmed = self.motors[i].torque == Some(false);
@@ -159,6 +184,7 @@ impl Controller {
                 if confirmed {
                     self.controlled[i] = false;
                     self.deadlines[i] = None;
+                    self.sent_targets.remove(JOINT_NAMES[i]);
                 }
                 d::Outcome {
                     joint: JOINT_NAMES[i].into(),
@@ -212,7 +238,7 @@ impl Controller {
             stop_unconfirmed: name(&self.inhibit),
             motors: self.motors.clone(),
             last_reply: self.last.clone(),
-            pickup_enforced: !self.blocked(),
+            pickup_enforced: self.blocked().then_some(false),
             snapshot_at_ns: duck_ipc_proto::clock::monotonic_ns(),
             sent_targets_rad: self.sent_targets.clone(),
             last_command: self.last_command.clone(),
@@ -232,10 +258,12 @@ impl Controller {
     }
     /// Process one mailbox operation and one background read, never IPC or disk work.
     pub fn tick<T: RobotIo>(&mut self, s: &mut Safety<T>, now: Instant, normal_idle: bool) -> bool {
+        self.tick_sequence += 1;
         let was = self.session.is_some() || self.inhibit.iter().any(|v| *v);
         if self.shared.relax.swap(false, Ordering::AcqRel) {
             self.controlled.fill(true);
-            self.stop(s, true);
+            let outcomes = self.stop(s, true);
+            self.last = Some(self.reply(outcomes));
             self.discard_pending();
         }
         if self.shared.cancel.swap(false, Ordering::AcqRel)
@@ -248,6 +276,10 @@ impl Controller {
                 reason: Some("session_terminated".into()),
                 session_id: None,
                 sequence: self.sequence,
+                committed_at_ns: duck_ipc_proto::clock::monotonic_ns(),
+                commit_tick: self.tick_sequence,
+                lease_ms: 300,
+                snapshot: None,
                 outcomes: out,
             });
         }
@@ -261,7 +293,7 @@ impl Controller {
             let may_stop = matches!(p.call, d::Call::Cancel(_))
                 || self.session.as_ref().is_some_and(|x| {
                     x.connection == p.connection
-                        && matches!(&p.call,d::Call::Stop(v) if v.session_id==x.id)
+                        && matches!(&p.call,d::Call::Stop(v)|d::Call::Release(v) if v.session_id==x.id)
                 });
             let r = self.execute(s, now, p.connection, &p.call);
             if may_stop {
@@ -280,11 +312,15 @@ impl Controller {
                 reason: Some("command_expired".into()),
                 session_id: self.session.as_ref().map(|v| v.id),
                 sequence: self.sequence,
+                committed_at_ns: duck_ipc_proto::clock::monotonic_ns(),
+                commit_tick: self.tick_sequence,
+                lease_ms: 300,
+                snapshot: None,
                 outcomes: out,
             });
         }
         // Cache reads are spaced over ticks. Acquisition waits for a complete post-reservation sweep.
-        if self.blocked() || self.refresh_remaining > 0 {
+        if self.blocked() || (self.refresh_remaining > 0 && normal_idle) {
             self.read(s, self.scan);
             self.scan = (self.scan + 1) % NUM_JOINTS;
             self.refresh_remaining = self.refresh_remaining.saturating_sub(1);
@@ -302,10 +338,34 @@ impl Controller {
                     .iter()
                     .any(|m| m.error.is_some() || m.torque.is_none())
                 {
-                    d::Reply::refused("torque_unknown")
+                    let mut r = d::Reply::refused("torque_unknown");
+                    r.outcomes = self
+                        .motors
+                        .iter()
+                        .filter(|m| m.torque.is_none())
+                        .map(|m| d::Outcome {
+                            joint: m.joint.clone(),
+                            status: "unknown".into(),
+                            error: m.error.clone(),
+                        })
+                        .collect();
+                    r
                 } else if self.motors.iter().any(|m| m.torque == Some(true)) {
-                    d::Reply::refused("torque_on")
+                    let mut r = d::Reply::refused("torque_on");
+                    r.outcomes = self
+                        .motors
+                        .iter()
+                        .filter(|m| m.torque == Some(true))
+                        .map(|m| d::Outcome {
+                            joint: m.joint.clone(),
+                            status: "torque_on".into(),
+                            error: None,
+                        })
+                        .collect();
+                    r
                 } else {
+                    self.sent_targets.clear();
+                    self.last_command = None;
                     self.generation += 1;
                     let id = self.generation;
                     let req = match &p.call {
@@ -319,6 +379,7 @@ impl Controller {
                         heartbeat: 0,
                         high: req,
                         cache: VecDeque::new(),
+                        acquire_reply: None,
                         acquire_request: match &p.call {
                             d::Call::Acquire(v) => v.clone(),
                             _ => unreachable!(),
@@ -330,52 +391,59 @@ impl Controller {
                         reason: None,
                         session_id: Some(id),
                         sequence: self.sequence,
+                        committed_at_ns: duck_ipc_proto::clock::monotonic_ns(),
+                        commit_tick: self.tick_sequence,
+                        lease_ms: 300,
+                        snapshot: None,
                         outcomes: vec![],
                     }
                 };
+                let mut reply = reply;
+                if reply.accepted {
+                    reply.snapshot = Some(self.motors.clone());
+                    if let Some(session) = self.session.as_mut() {
+                        session.acquire_reply = Some(reply.clone());
+                    }
+                }
                 self.last = Some(reply.clone());
                 let _ = p.reply.send(reply);
             } else {
                 self.acquiring = Some((p, since));
             }
         }
-        if self.acquiring.is_none() {
-            if let Ok(p) = self.rx.try_recv() {
-                if !p.reply.is_closed() {
-                    if let d::Call::Acquire(v) = &p.call {
-                        if self
-                            .session
-                            .as_ref()
-                            .is_some_and(|x| x.connection == p.connection)
-                        {
-                            let session = self.session.as_ref().unwrap();
-                            let r = if *v == session.acquire_request {
-                                d::Reply {
-                                    accepted: true,
-                                    reason: None,
-                                    session_id: Some(session.id),
-                                    sequence: 0,
-                                    outcomes: vec![],
-                                }
-                            } else {
-                                d::Reply::refused("request_conflict")
-                            };
-                            let _ = p.reply.send(r);
-                        } else if self.blocked() {
-                            let _ = p.reply.send(d::Reply::refused("busy"));
-                        } else if !normal_idle {
-                            let _ = p.reply.send(d::Reply::refused("controller_active"));
-                        } else if v.mode != "maintenance_raw" || !v.acknowledge_raw {
-                            let _ = p.reply.send(d::Reply::refused("acknowledge_raw_required"));
-                        } else {
-                            self.acquiring = Some((p, now));
-                        }
+        if self.acquiring.is_none()
+            && let Ok(p) = self.rx.try_recv()
+            && !p.reply.is_closed()
+        {
+            if let d::Call::Acquire(v) = &p.call {
+                if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|x| x.connection == p.connection)
+                {
+                    let session = self.session.as_ref().unwrap();
+                    let r = if *v == session.acquire_request {
+                        session
+                            .acquire_reply
+                            .clone()
+                            .unwrap_or_else(|| d::Reply::refused("missing_acquire_outcome"))
                     } else {
-                        let reply = self.execute(s, now, p.connection, &p.call);
-                        self.last = Some(reply.clone());
-                        let _ = p.reply.send(reply);
-                    }
+                        d::Reply::refused("request_conflict")
+                    };
+                    let _ = p.reply.send(r);
+                } else if self.blocked() {
+                    let _ = p.reply.send(d::Reply::refused("busy"));
+                } else if !normal_idle {
+                    let _ = p.reply.send(d::Reply::refused("controller_active"));
+                } else if v.mode != "maintenance_raw" || !v.acknowledge_raw {
+                    let _ = p.reply.send(d::Reply::refused("acknowledge_raw_required"));
+                } else {
+                    self.acquiring = Some((p, now));
                 }
+            } else {
+                let reply = self.execute(s, now, p.connection, &p.call);
+                self.last = Some(reply.clone());
+                let _ = p.reply.send(reply);
             }
         }
         self.publish(now);
@@ -388,6 +456,12 @@ impl Controller {
         connection: u64,
         call: &d::Call,
     ) -> d::Reply {
+        if let Some((owner, old, r)) = &self.terminal
+            && *owner == connection
+            && old == call
+        {
+            return r.clone();
+        }
         let rid = match call {
             d::Call::Torque(v) => Some((v.session_id, v.request_id)),
             d::Call::Gains(v) => Some((v.session_id, v.request_id)),
@@ -401,13 +475,16 @@ impl Controller {
                 .is_some_and(|x| x.connection == connection && x.id == *sid && *id > x.high)
         });
         let reply = self.execute_inner(s, now, connection, call);
-        if let (Some((sid, id)), Some(session)) = (new, self.session.as_mut()) {
-            if session.id == sid {
-                session.high = id;
-                session.cache.push_back((id, call.clone(), reply.clone()));
-                if session.cache.len() > CACHE {
-                    session.cache.pop_front();
-                }
+        if new.is_some() && matches!(call, d::Call::Release(_)) && self.session.is_none() {
+            self.terminal = Some((connection, call.clone(), reply.clone()));
+        }
+        if let (Some((sid, id)), Some(session)) = (new, self.session.as_mut())
+            && session.id == sid
+        {
+            session.high = id;
+            session.cache.push_back((id, call.clone(), reply.clone()));
+            if session.cache.len() > CACHE {
+                session.cache.pop_front();
             }
         }
         reply
@@ -430,6 +507,10 @@ impl Controller {
                 reason: Some("scheduled".into()),
                 session_id: self.session.as_ref().map(|x| x.id),
                 sequence: self.sequence,
+                committed_at_ns: duck_ipc_proto::clock::monotonic_ns(),
+                commit_tick: self.tick_sequence,
+                lease_ms: 300,
+                snapshot: None,
                 outcomes: vec![],
             };
         }
@@ -519,13 +600,12 @@ impl Controller {
                 }
             }
         }
-        if let d::Call::Gains(v) = call {
-            if v.gains
+        if let d::Call::Gains(v) = call
+            && v.gains
                 .values()
                 .any(|p| !duck_control::diagnostics::pid_valid(*p))
-            {
-                return d::Reply::refused("invalid_value");
-            }
+        {
+            return d::Reply::refused("invalid_value");
         }
         if self.inhibit.iter().any(|v| *v)
             && !matches!(
@@ -660,6 +740,10 @@ impl Controller {
             reason: (!accepted).then(|| "partial_failure".into()),
             session_id: self.session.as_ref().map(|v| v.id),
             sequence: self.sequence,
+            committed_at_ns: duck_ipc_proto::clock::monotonic_ns(),
+            commit_tick: self.tick_sequence,
+            lease_ms: 300,
+            snapshot: None,
             outcomes,
         }
     }
@@ -678,6 +762,7 @@ pub fn user_id(name: &str) -> Option<u32> {
     // getpwnam's static storage is used only during single-threaded startup initialization.
     let p = unsafe { libc::getpwnam(name.as_ptr()) };
     if p.is_null() {
+        tracing::warn!(user=%name.to_string_lossy(),"account missing; no maintenance permission granted");
         None
     } else {
         Some(unsafe { (*p).pw_uid })
@@ -721,6 +806,7 @@ mod tests {
             heartbeat: 0,
             high: 1,
             cache: VecDeque::new(),
+            acquire_reply: None,
             acquire_request: d::Acquire {
                 request_id: 1,
                 mode: "maintenance_raw".into(),
@@ -745,11 +831,8 @@ mod tests {
             });
             assert!(req(&mut c, &mut s, on.clone()).accepted);
             assert!(req(&mut c, &mut s, on).accepted);
-            for j in 0..NUM_JOINTS {
-                assert_eq!(
-                    s.diagnostic_read(JOINT_IDS[j]).unwrap().torque,
-                    Some(i == j)
-                );
+            for (j, id) in JOINT_IDS.iter().enumerate() {
+                assert_eq!(s.diagnostic_read(*id).unwrap().torque, Some(i == j));
             }
             let pid = d::Pid { p: 123, i: 3, d: 4 };
             assert!(
@@ -1135,5 +1218,75 @@ mod tests {
             req(&mut c, &mut s, changed).reason.as_deref(),
             Some("request_conflict")
         );
+    }
+    #[test]
+    fn repeated_release_does_not_terminate_a_new_session() {
+        let (mut c, mut s) = setup();
+        acquired(&mut c, Instant::now());
+        let release = d::Call::Release(d::Session {
+            session_id: 1,
+            request_id: 2,
+        });
+        let r = req(&mut c, &mut s, release.clone());
+        assert!(r.accepted);
+        assert_eq!(req(&mut c, &mut s, release.clone()), r);
+        acquired(&mut c, Instant::now());
+        c.session.as_mut().unwrap().id = 2;
+        assert_eq!(req(&mut c, &mut s, release), r);
+        assert_eq!(c.session.as_ref().unwrap().id, 2);
+    }
+    #[test]
+    fn failed_readback_cannot_confirm_pid_or_goal_and_expiry_does_not_hammer_bus() {
+        let (mut c, _) = setup();
+        let mut io = FakeIo::new();
+        io.diagnostic_fail_after_reads = Some(1);
+        let mut safety = Safety::new(io, SafetyConfig::default());
+        acquired(&mut c, Instant::now());
+        c.read(&mut safety, 9);
+        assert!(c.motors[9].pid.is_some());
+        c.read(&mut safety, 9);
+        assert!(c.motors[9].pid.is_none());
+        assert!(c.motors[9].goal_rad.is_none());
+        assert!(c.motors[9].position_counts.is_none());
+        c.controlled[9] = true;
+        c.deadlines[9] = Some(Instant::now());
+        c.tick(&mut safety, Instant::now(), true);
+        assert!(c.inhibit[9]);
+        assert!(c.deadlines[9].is_none());
+    }
+    #[test]
+    fn unconfirmed_enable_is_cut_and_latched() {
+        let (mut c, _) = setup();
+        let mut io = FakeIo::new();
+        io.diagnostic_fail_after_reads = Some(2);
+        let mut s = Safety::new(io, SafetyConfig::default());
+        acquired(&mut c, Instant::now());
+        let r = req(
+            &mut c,
+            &mut s,
+            d::Call::Torque(d::Torque {
+                session_id: 1,
+                request_id: 2,
+                joints: vec!["mouth".into()],
+                on: true,
+            }),
+        );
+        assert!(!r.accepted);
+        assert!(c.inhibit[9]);
+        assert!(c.controlled[9]);
+    }
+    #[test]
+    fn refresh_admission_is_rate_limited_before_enqueueing_and_normal_motion_is_not_scanned() {
+        let (mut c, _) = setup();
+        assert!(c.shared.admit_refresh(2_000_000_000));
+        assert!(!c.shared.admit_refresh(2_000_000_001));
+        assert!(c.shared.admit_refresh(3_000_000_000));
+        let mut io = FakeIo::new();
+        io.diagnostic_fail_id = Some(34);
+        let mut s = Safety::new(io, SafetyConfig::default());
+        for _ in 0..20 {
+            c.tick(&mut s, Instant::now(), false);
+        }
+        assert!(c.motors.iter().all(|m| m.observed_at_ns == 0));
     }
 }

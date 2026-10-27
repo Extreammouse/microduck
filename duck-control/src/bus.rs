@@ -531,36 +531,7 @@ impl RobotIo for DynamixelIo {
                 expected: 148,
                 got: blocks.first().map_or(0, Vec::len),
             })?;
-        let u16at = |n: usize| u16::from_le_bytes([b[n], b[n + 1]]);
-        let i32at = |n: usize| i32::from_le_bytes([b[n], b[n + 1], b[n + 2], b[n + 3]]);
-        let rad = |n: usize| 2.0 * PI * i32at(n) as f64 / 4096.0 - PI;
-        let mut m = crate::diagnostics::empty_motor(id)?;
-        m.model_number = Some(u16at(0));
-        m.firmware_version = Some(b[6]);
-        m.hardware_error = Some(b[70]);
-        m.voltage_v = Some(u16at(144) as f64 * 0.1);
-        m.temperature_c = Some(b[146]);
-        m.current_limit = Some(u16at(38));
-        m.pwm_limit = Some(u16at(36));
-        m.velocity_limit = Some(i32at(44) as u32);
-        m.shutdown = Some(b[63]);
-        m.torque = Some(b[64] != 0);
-        m.position_counts = Some(i32at(132));
-        m.goal_rad = Some(rad(116));
-        m.pid = Some(crate::diagnostics::Pid {
-            p: u16at(84),
-            i: u16at(82),
-            d: u16at(80),
-        });
-        m.homing_offset_counts = Some(i32at(20));
-        m.before_startup_fix = self.startup_homing[i];
-        m.operating_mode = Some(b[11]);
-        m.drive_mode = Some(b[10]);
-        m.min_position_rad = Some(rad(52));
-        m.max_position_rad = Some(rad(48));
-        m.profile_velocity = Some(i32at(112) as u32);
-        m.profile_acceleration = Some(i32at(108) as u32);
-        Ok(m)
+        crate::diagnostics::decode_registers(id, b, self.startup_homing[i])
     }
     fn diagnostic_goals(&mut self, goals: &[(u8, f64)]) -> Result<()> {
         for &(id, q) in goals {
