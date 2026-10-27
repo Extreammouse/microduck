@@ -22,6 +22,15 @@ Other regressions cover every motor's selective torque/PID/goal path, seeding an
 failure, partial gains, stale heartbeat, lease/disconnect cleanup, independent inhibit recovery,
 request conflict/eviction, superseded target deadlines and unrelated-motor holds.
 
+A targeted follow-up found a concurrent acquire could hide a completed-session edge. The
+controller now retains an exit-owed barrier until the integration acknowledges fresh goal/PID
+restoration; new acquisitions remain excluded throughout. Regression tests race acquisition
+against release and check the barrier across ticks. A non-owner cannot replace a pending owner
+stop/release, and terminal release retries remain allowed for the prior owner.
+
+Unconfirmed stop is deliberately not retried every tick: status retains the inhibit and an
+operator cancel/relax retries it. This is the agreed raw-mode failure contract, not a watchdog.
+
 ## Checks
 
 Local full-workspace tests pass on macOS excluding `nfc`: the unchanged nfcd binary imports

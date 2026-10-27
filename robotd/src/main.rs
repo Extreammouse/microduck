@@ -2478,6 +2478,9 @@ async fn control_loop<T: RobotIo>(
                 tracing::warn!(error=%e,"maintenance exit restore failed; keeping writes inhibited");
                 maintenance_exit_pending = true;
             }
+            if !maintenance_exit_pending {
+                maintenance.finish_exit();
+            }
             state.diagnostics.blocked.store(
                 maintenance.blocked() || maintenance_exit_pending,
                 Ordering::Release,

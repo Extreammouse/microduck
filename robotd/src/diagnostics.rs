@@ -25,6 +25,7 @@ pub struct Pending {
 pub struct Shared {
     pub blocked: AtomicBool,
     pub owner: AtomicU64,
+    last_owner: AtomicU64,
     pub cancel: AtomicBool,
     pub relax: AtomicBool,
     pub status: ArcSwap<d::Status>,
@@ -40,6 +41,7 @@ impl Shared {
         Self {
             blocked: AtomicBool::new(false),
             owner: AtomicU64::new(0),
+            last_owner: AtomicU64::new(0),
             cancel: AtomicBool::new(false),
             relax: AtomicBool::new(false),
             status: ArcSwap::from_pointee(d::Status::default()),
@@ -62,14 +64,25 @@ impl Shared {
         {
             return Err("rate_limited");
         }
+        let owner = self.owner.load(Ordering::Acquire);
+        let terminal_release = matches!(p.call, d::Call::Release(_))
+            && owner == 0
+            && self.last_owner.load(Ordering::Acquire) == p.connection;
+        if matches!(p.call, d::Call::Stop(_) | d::Call::Release(_))
+            && owner != p.connection
+            && !terminal_release
+        {
+            return Err("wrong_session");
+        }
         if matches!(
             p.call,
             d::Call::Stop(_) | d::Call::Release(_) | d::Call::Cancel(_)
         ) {
             let mut slot = self.priority.lock().map_err(|_| "busy")?;
-            if let Some(old) = slot.replace(p) {
-                let _ = old.reply.send(d::Reply::refused("superseded_stop"));
+            if slot.is_some() {
+                return Err("stop_pending");
             }
+            *slot = Some(p);
             Ok(())
         } else {
             self.tx.try_send(p).map_err(|_| "busy")
@@ -124,6 +137,7 @@ pub struct Controller {
     sent_targets: std::collections::BTreeMap<String, f64>,
     last_command: Option<d::Command>,
     terminal: Option<(u64, d::Call, d::Reply)>,
+    exit_owed: bool,
     shared: Arc<Shared>,
     last_refresh: Instant,
     refresh_remaining: usize,
@@ -150,12 +164,16 @@ impl Controller {
             sent_targets: Default::default(),
             last_command: None,
             terminal: None,
+            exit_owed: false,
             last_refresh: Instant::now() - Duration::from_secs(2),
             refresh_remaining: NUM_JOINTS,
         }
     }
     pub fn blocked(&self) -> bool {
-        self.session.is_some() || self.acquiring.is_some() || self.inhibit.iter().any(|v| *v)
+        self.exit_owed
+            || self.session.is_some()
+            || self.acquiring.is_some()
+            || self.inhibit.iter().any(|v| *v)
     }
     fn read<T: RobotIo>(&mut self, s: &mut Safety<T>, i: usize) {
         match s.diagnostic_read(JOINT_IDS[i]) {
@@ -203,6 +221,9 @@ impl Controller {
             .collect()
     }
     fn stop<T: RobotIo>(&mut self, s: &mut Safety<T>, close: bool) -> Vec<d::Outcome> {
+        if close && (self.session.is_some() || self.inhibit.iter().any(|v| *v)) {
+            self.exit_owed = true;
+        }
         let ids: Vec<_> = (0..NUM_JOINTS)
             .filter(|&i| self.controlled[i] || self.inhibit[i])
             .collect();
@@ -210,6 +231,11 @@ impl Controller {
         if close {
             if let Some((p, _)) = self.acquiring.take() {
                 let _ = p.reply.send(d::Reply::refused("cancelled"));
+            }
+            if let Some(session) = self.session.as_ref() {
+                self.shared
+                    .last_owner
+                    .store(session.connection, Ordering::Release);
             }
             self.session = None;
             self.shared.owner.store(0, Ordering::Release);
@@ -229,6 +255,7 @@ impl Controller {
                 .collect()
         };
         let st = d::Status {
+            exit_pending: self.exit_owed,
             mode: self.blocked().then(|| "maintenance_raw".into()),
             session_id: self.session.as_ref().map(|s| s.id),
             lease_remaining_ms: self.session.as_ref().map_or(0, |s| {
@@ -259,7 +286,7 @@ impl Controller {
     /// Process one mailbox operation and one background read, never IPC or disk work.
     pub fn tick<T: RobotIo>(&mut self, s: &mut Safety<T>, now: Instant, normal_idle: bool) -> bool {
         self.tick_sequence += 1;
-        let was = self.session.is_some() || self.inhibit.iter().any(|v| *v);
+
         if self.shared.relax.swap(false, Ordering::AcqRel) {
             self.controlled.fill(true);
             let outcomes = self.stop(s, true);
@@ -447,7 +474,10 @@ impl Controller {
             }
         }
         self.publish(now);
-        was && !self.blocked()
+        self.exit_owed
+            && self.session.is_none()
+            && self.acquiring.is_none()
+            && !self.inhibit.iter().any(|v| *v)
     }
     fn execute<T: RobotIo>(
         &mut self,
@@ -725,6 +755,13 @@ impl Controller {
         };
         self.reply(out)
     }
+    /// The integration acknowledges only after fresh normal goals/PID are restored off-torque.
+    pub fn finish_exit(&mut self) {
+        if self.session.is_none() && self.acquiring.is_none() && !self.inhibit.iter().any(|v| *v) {
+            self.exit_owed = false;
+            self.publish(Instant::now());
+        }
+    }
     pub fn shutdown<T: RobotIo>(&mut self, s: &mut Safety<T>) {
         if self.blocked() {
             self.stop(s, true);
@@ -799,6 +836,8 @@ mod tests {
         )
     }
     fn acquired(c: &mut Controller, now: Instant) {
+        c.finish_exit();
+        c.shared.owner.store(1, Ordering::Release);
         c.session = Some(Session {
             connection: 1,
             id: 1,
@@ -870,6 +909,8 @@ mod tests {
                 .accepted
             );
             assert_eq!(s.diagnostic_read(JOINT_IDS[i]).unwrap().torque, Some(false));
+            assert!(c.exit_owed);
+            c.finish_exit();
             assert!(!c.blocked());
         }
     }
@@ -977,6 +1018,8 @@ mod tests {
             )
             .accepted
         );
+        assert!(c.exit_owed);
+        c.finish_exit();
         assert!(!c.blocked());
     }
     #[test]
@@ -1288,5 +1331,75 @@ mod tests {
             c.tick(&mut s, Instant::now(), false);
         }
         assert!(c.motors.iter().all(|m| m.observed_at_ns == 0));
+    }
+    #[test]
+    fn exit_is_owed_until_integration_acknowledges_even_if_an_acquire_races() {
+        let (mut c, mut s) = setup();
+        acquired(&mut c, Instant::now());
+        assert!(
+            req(
+                &mut c,
+                &mut s,
+                d::Call::Release(d::Session {
+                    session_id: 1,
+                    request_id: 2
+                })
+            )
+            .accepted
+        );
+        assert!(c.blocked());
+        assert!(c.exit_owed);
+        let (tx, mut rx) = oneshot::channel();
+        c.shared
+            .tx
+            .try_send(Pending {
+                connection: 2,
+                call: d::Call::Acquire(d::Acquire {
+                    request_id: 1,
+                    mode: "maintenance_raw".into(),
+                    acknowledge_raw: true,
+                }),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(c.tick(&mut s, Instant::now(), true));
+        assert_eq!(rx.try_recv().unwrap().reason.as_deref(), Some("busy"));
+        assert!(c.tick(&mut s, Instant::now(), true));
+        assert!(c.shared.blocked.load(Ordering::Acquire));
+        c.finish_exit();
+        assert!(!c.blocked());
+        assert!(!c.shared.blocked.load(Ordering::Acquire));
+    }
+    #[test]
+    fn non_owner_cannot_replace_a_pending_release() {
+        let (mut c, _) = setup();
+        acquired(&mut c, Instant::now());
+        let (tx, _rx) = oneshot::channel();
+        c.shared
+            .enqueue(Pending {
+                connection: 1,
+                call: d::Call::Release(d::Session {
+                    session_id: 1,
+                    request_id: 2,
+                }),
+                reply: tx,
+            })
+            .unwrap();
+        let (tx, _rx) = oneshot::channel();
+        assert_eq!(
+            c.shared.enqueue(Pending {
+                connection: 2,
+                call: d::Call::Stop(d::Session {
+                    session_id: 1,
+                    request_id: 2
+                }),
+                reply: tx
+            }),
+            Err("wrong_session")
+        );
+        assert!(matches!(
+            c.shared.priority.lock().unwrap().as_ref().unwrap().call,
+            d::Call::Release(_)
+        ));
     }
 }

@@ -80,6 +80,9 @@ stop_unconfirmed and refuses normal writes/new acquisition. Fix communication/po
 then cancel or relax to retry readback; no daemon restart is needed merely to reclaim a lost
 session. Never interpret a sent packet or successful RPC as proof that torque is off.
 
+Status exposes `exit_pending` until fresh normal goals and gains are restored with torque off;
+new acquisition remains blocked through that handoff.
+
 After confirmed release, use normal enable explicitly to return to the policy. Normal gains may
 be restored at the first normal tick with torque off; torque is not restored automatically.
 For a native latched hardware fault: release/cancel and confirm off, use the existing

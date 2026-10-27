@@ -209,6 +209,7 @@ impl Reply {
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Status {
+    pub exit_pending: bool,
     pub mode: Option<String>,
     pub session_id: Option<u64>,
     pub lease_remaining_ms: u64,
