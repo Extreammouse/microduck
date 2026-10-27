@@ -1,123 +1,104 @@
-# Robot diagnostics and raw maintenance mode
+# All-motor diagnostics and raw maintenance v1
 
-**Proposal for review — not implemented.** This page owns the diagnostic session, its API and
-records. Existing control and bus ownership belong to [robotd-design.md](robotd-design.md),
-authority and transports to [architecture.md](architecture.md), deployment to
-[updater-design.md](updater-design.md).
+**Design proposal — not implemented.** This page owns diagnostic sessions and their API.
+[robotd-design.md](robotd-design.md) owns normal control and bus mechanisms;
+[architecture.md](architecture.md) owns service/transport authority. This revision narrows v1
+following a read-only Claude Code scope review of `b3841c5` and resolves the session semantics
+needed before implementation. No robot installation, movement or configuration change is included.
 
-## 1. Purpose and agreed behaviour
+## 1. Scope
 
-Provide direct, observable access to **all 15 motors** for debugging, independently of the
-walking policies and their behavioural protections. One execution path and API cover every
-motor; no joint has a privileged implementation or commissioning order. Inspection, commanded
-motion and recording should work with a robot lying down, supported or manually positioned.
+Provide a direct, observable maintenance interface for **all 15 motors**, including mouth,
+through one execution path. No joint has a privileged implementation or commissioning order.
+The operator chooses physical support and target angles; no policy or anatomical protection
+modifies those commands. Motor testing and calibration are different operations.
 
-This is an explicitly selected **raw maintenance mode**. During the session:
+### Included in v1
 
-- Policies, skills, balancing, pickup pause, fall reactions and automatic recovery do not
-  generate or modify motor commands. No pickup/support classifier or posture-qualified fixture
-  profile is required to admit a test. Sensor verdicts remain visible as observations.
-- Targets, RAM gains and torque state come from the diagnostic client. No anatomical clamp,
-  collision avoidance or hidden trajectory smoothing changes a raw target. Unselected motors
-  are unaffected unless explicitly declared in the session's torque plan.
-- The existing robotd process remains the only bus owner. Diagnostics is not permission to
-  open the UART from a second script.
-- Explicit stop/relax, connection-loss termination, protocol validity and native servo limits
-  remain defined. Native electrical/thermal shutdown is neither disabled nor advertised as
-  software collision protection. A servo can refuse a command that the raw API accepts.
-- Leaving maintenance never resumes a policy automatically. The ordinary robot's configuration
-  and protections are unchanged outside the session.
+- All-motor inventory, cached register inspection, bounded read-only refresh and status.
+- A local, connection-bound exclusive `maintenance_raw` session.
+- Selected-joint absolute position commands, selective torque and RAM position P/I/D gains.
+- Explicit stop/cancel, per-command expiry, lease expiry and a recoverable unconfirmed-stop latch.
+- Existing `robot.subscribe` telemetry extended with a maintenance block; recording on the client.
+- One persistent `robotctl diagnose session` process, interactive or scripted.
 
-The operator chooses the physical setup and commanded excursion. Raw mode can drive a joint
-into a mechanical stop or collision: the UI must not label it protected or infer that a valid
-command is mechanically safe. This is a mode contract, not an additional confirmation on each
-command. Entering the explicit mode acknowledges that contract once per session.
+### Deferred
 
-This proposal changes the earlier protection-gated direction: diagnostic motion no longer
-waits for pickup applicability, a new support classifier, fixture interlocks or anatomical
-profile qualification. Those mechanisms are not prerequisites for this feature.
+No experiment/suite engine, prepare/arm/run pipeline, robot-side recorder/export/report service,
+passive event-triggered recorder, multi-service support bundle, camera orchestration, statistical
+summaries or vetbook integration. Scripts can implement finite experiments and record existing
+telemetry without adding execution machinery in robotd. Relative commands are deferred: the
+client can inspect and compute an absolute target explicitly. No hardware watchdog integration
+in v1; document measured host-loss behaviour without claiming a guarantee.
 
-### Why this is needed
+EEPROM calibration, native limit/shutdown changes, operating-mode switching and additional
+current/PWM/velocity control modes are separate future designs. A stalled servo can be recovered
+through the existing reboot path **after confirmed session release**, then reacquired; no new
+in-session reboot or automatic error clearing.
 
-On baseline 0.17.9 (`96b89d8613f06722c1d64ce75ab0d7124fed9d8f`, API 44), joint telemetry exists,
-but init moves all joints and skills replace the ordinary controller. There is no isolated
-per-motor test API. Short asymmetric walking trials motivated investigation but do not identify
-an electronic or physical zero error. An external USB camera makes movement visible, not
-calibrated: a physical angle reference remains necessary for calibration conclusions.
+### Raw means raw
 
-## 2. Architecture
+Policies, balancing, pickup pause, fall reactions, anatomical clamping, collision avoidance and
+automatic recovery do not generate, alter or block maintenance targets. Pickup/fall observations
+can remain visible but must say they are not enforced. No posture-qualified fixture profile,
+support/lift classifier, camera readiness or hold-to-run is required.
+
+Native servo restrictions and electrical/thermal shutdown remain unchanged. Protocol validity,
+exclusive authority, explicit stop and connection-loss termination still apply. No silent
+clipping or software slew limiting of raw targets; inspect native servo profile velocity and
+acceleration because native smoothing may still exist. Valid protocol input is not a promise
+of mechanical clearance. Entry acknowledges the raw contract once; there is no per-command
+confirmation. Normal operation retains its existing behaviour and protection configuration.
+
+The inspected baseline is 0.17.9, `96b89d8613f06722c1d64ce75ab0d7124fed9d8f`, API 44. It has
+joint telemetry but no isolated actuator API; init moves all joints, and skill execution is
+policy-driven. Short asymmetric walking observations motivate diagnostics but identify neither
+a bad mechanical zero nor a failed motor.
+
+## 2. Concrete implementation seam
 
 ```mermaid
 flowchart LR
-    CLI[robotctl diagnose / diagnostic client] --> RPC[robotd local JSON-RPC]
-    RPC --> Q[Bounded command mailbox]
-    Q --> D[Raw maintenance controller]
-    Normal[Policy / skills / normal protections] --> A[Exclusive authority selector]
+    C[Persistent CLI / diagnostic client] --> RPC[robotd local JSON-RPC]
+    RPC --> Q[Bounded operation mailbox]
+    Q --> D[Maintenance session controller]
+    Normal[Normal policies / skills] --> A[Exclusive write authority]
     D --> A
-    A --> IO[Single RobotIo and bus owner]
-    Stop[Stop / lease expiry] --> D
-    IO --> T[Timestamped telemetry and readback cache]
-    D --> T
-    T --> R[Bounded recording queue]
-    R --> W[Writer outside control tick]
-    T --> RPC
+    A --> S[Safety owning the sole RobotIo]
+    S --> Bus[Existing motor bus]
+    Cancel[Priority cancel latch] --> D
+    Bus --> Cache[Readback and telemetry cache]
+    D --> Cache
+    Cache --> Stream[Existing robot.subscribe]
+    Stream --> File[Client JSONL writer]
 ```
 
-No additional daemon, UART connection or network listener. `robotd/src/diagnostics.rs` owns the
-session state, command scheduling and optional experiment generator. IPC tasks validate shape,
-authorization and message size, then submit bounded messages; only the control thread commits
-authority, torque/gain writes and targets. A full mailbox returns `busy`, never an unbounded
-backlog of movements. Stop uses a separate priority latch.
+The current `RobotIo::write` writes all JOINT_IDS, `set_gain` writes every servo and forces
+I=D=0, and the normal loop calls `Safety::apply` every tick. They cannot implement selective raw
+commands as-is. This refactor is required, not conditional:
 
-Refactor the target-selection and low-level write boundary so normal control keeps its existing
-Safety path and raw maintenance deliberately bypasses its behavioural clamps. Do not bypass by
-spoofing IMU data, modifying pickup features or setting global configuration flags. If the
-current Safety wrapper prevents direct maintenance writes, factor its sole RobotIo ownership
-into a shared actuator boundary selected by explicit authority; do not create two handles.
-Keep the normal path's semantics unchanged and prove isolation in tests.
+1. Extend RobotIo with selected-ID goal writes, selected torque, per-ID P/I/D read/write and
+   goal/torque/gain readback. Return honest operation-specific outcomes. Extend FakeIo to keep
+   state and write counters **per motor**, rather than global torque/gain values.
+2. Keep Safety's sole RobotIo handle. Add a maintenance-only operation path reachable only
+   under the explicit maintenance authority; it uses protocol validation, not normal clamping.
+3. During maintenance and unresolved stop faults, continue sensing/observation but skip normal
+   `gate`/`apply` and all policy/skill/power target generation. Normal targets and global gains
+   must never overwrite maintenance state. Do not spoof sensors or modify persistent pickup flags.
+4. IPC tasks validate shape/credentials and enqueue bounded operations. Only the bus-owning
+   control thread commits authority and performs serial I/O. Stop/cancel uses a separate priority
+   latch, not a mailbox slot that can be exhausted by ordinary commands.
 
-Read-only inspection uses cached fast telemetry and slow register reads scheduled by the bus
-owner. Record the values observed before startup correction as well as expected values and
-readback. Starting robotd can correct EEPROM; diagnostics.inspect/refresh must not call that
-correcting function or pretend those startup writes did not happen. Additional register reads
-have a measured bus budget and report unavailable/stale data instead of blocking the tick.
+No new daemon, UART handle or network listener. Snapshot refresh schedules bounded reads by the
+same bus owner; RPC threads never run a register scan. Preserve values already read before
+startup register correction alongside expected/after values. inspect/refresh never call the
+correcting startup function. Per-field timestamp/status distinguishes desired, observed, stale,
+unavailable and failed values. Additional reads have a measured bus budget and must not hold up
+the 50 Hz tick. No file/network work in the motor tick.
 
-Existing services keep their devices and contracts: padd/configd for input/pairing, mediad for
-camera/audio, tofd for depth/head sensing. The laptop CLI can assemble their read-only health
-snapshots into a support bundle without inventing competing configuration routes. Passive
-error-triggered recording may capture bus/IMU/loop failures with finite pre/post windows and
-cooldowns; a diagnostic trigger never starts motion or repairs/restarts a service.
+## 3. Inventory and command semantics
 
-### Session and authority
-
-States: `idle → acquired → active → stopping → acquired → closed`; failures may enter `faulted`.
-Acquisition grants ownership without moving, enabling torque or homing. Refuse while another
-controller is active: do not silently stop a walking robot. Clear pending normal intents on
-entry/exit, reject normal actuator commands while owned, and prevent delayed pad/skill commands
-from executing after release. Include head/look and mouth sources in the exclusion.
-
-Tie the session to Unix peer credentials, its originating connection and robot boot epoch.
-An opaque token prevents session mixups; it does not replace authorization. Reconnect may read
-the report but cannot revive a lease or replay movement. All mutation requests have request IDs:
-same ID/same payload returns the prior outcome; different payload is `request_conflict`.
-
-A keepalive renews a server-monotonic deadline; candidate values for review are 100 ms renewal
-and 300 ms expiry. Commands have explicit durations or validity deadlines, including a stationary
-hold. This bounds operation after loss of the client without using pickup, fall or collision
-logic. Explicit stop, connection close, lease expiry and duration completion apply the declared
-stop action. Lease expiry cannot be disabled in v1. A camera is optional and does not gate motion.
-
-Keep `robot.safeToRestart=false` throughout ownership, including torque-on holds. No automatic
-policy resume, homing, pose restoration or re-energizing on exit. Invalidate gain/torque caches
-changed by maintenance so the next explicit normal enable reapplies its configured settings.
-A process crash or hung control thread cannot be stopped by an in-process deadline: document
-and test actual servo behaviour on host loss. A hardware watchdog is a separate review decision,
-not a claim that a classifier protects raw mode.
-
-## 3. Full motor coverage and commands
-
-Use JOINT_NAMES/JOINT_IDS from duck-ipc-proto, not the 14-action policy vector. The mouth is a
-motor even though policies omit it.
+Use duck-ipc-proto JOINT_NAMES/JOINT_IDS directly, independently of the 14-action policy vector.
 
 | Motor | Bus ID |
 |---|---:|
@@ -137,241 +118,275 @@ motor even though policies omit it.
 | `right_knee` | 13 |
 | `right_ankle` | 14 |
 
-Every motor supports inspection, position commands, explicit torque enable/disable and RAM
-position PID gain read/write through the same schema. Start with the existing position operating
-mode. Current/PWM/velocity operating modes require a later explicit extension, not an implicit
-mode switch. Native EEPROM limits and operating/drive modes remain visible, unchanged in v1.
+All motors support the same inspection/torque/PID/position schema when the backend supports it.
+Missing motors remain listed with a reason. Position is absolute radians in the existing runtime
+coordinate system; raw encoder counts are exposed separately for inspection. The homing already
+affects present position: do not add or subtract it a second time. No joint-specific client math.
 
-Raw position commands accept a selected map of joint names to absolute radians. An optional
-relative command explicitly references an immutable fresh measured snapshot ID; never silently
-rebase a retried delta to a newer pose. Multiple selected joints can be written in one tick;
-one-motor testing is the simple default, not an architectural restriction. Reject unsupported
-backend operations instead of energizing all motors as a fallback.
+Multiple selected motors may receive targets in one sync write. Non-selected goal, torque and
+gain registers are untouched. Reject unsupported selection rather than writing all fifteen.
+V1 requires the expected position operating mode and publishes its native register ranges.
+NaN/infinity, unknown/duplicate joints and unrepresentable values are rejected before sending;
+representability checks are not anatomical limits. Distinguish hardware readback from assumptions
+about what the servo accepted. Do not claim a generic +/-pi range is the native range in all modes.
 
-Torque enable is a separate explicit operation. Before enabling a selected servo, seed its goal
-with its fresh measured position while torque is off, verify the write, then enable; this avoids
-moving to a forgotten goal from a previous session. Subsequent raw target writes have no hidden
-slew limiter. Record the seeding sequence; failure leaves that servo off and reports the outcome.
-Selective gain and torque operations must report partial success by motor: bus writes are not
-an atomic transaction across fifteen devices. A failed compound operation latches failure and
-performs the declared stop; it does not continue silently on the remaining subset.
+### Entry, ownership and torque-on hold
 
-Optional finite experiment helpers generate explicit targets: approach/hold/return, stepped
-position, bidirectional sweep and repeated comparison. Parameters include amplitude, duration,
-rate, repeats and optional gain. Smoothing and a return are properties of the chosen helper,
-never injected into raw writes. Preview shows the exact generated trajectory and torque/gain
-changes. A finite suite is a list of these calls across any/all motors, not a scripting language.
-Mirrored comparison uses explicit side conventions; unpaired head/mouth motors use before/after
-repeats. A skipped, missing or failed motor appears in the 15-entry coverage report.
+Acquire requires `enabled=false`, no active controller/bringup/skill/shutdown sequence, no pending
+power/skill intent, and fresh **torque-enable readback off for all 15 motors**. Held/Ready without
+an enabled policy is not sufficient if torque is on. Any on/unknown value refuses with `torque_on`
+or `torque_unknown` and named motors. The operator can explicitly use existing robot.relax first.
+These are authority/state preconditions, not pickup or posture checks. Acquisition never relaxes,
+homes, moves, enables torque or automatically adopts powered joints.
 
-Setup notes and recommended ranges can be recorded as metadata/presets, but are advisory in raw
-mode. They cannot masquerade as validated collision protection or impose hidden admission gates.
-Optional user-selected current/tracking/temperature abort thresholds belong to an experiment,
-are listed in preview and reports, and default to absent in raw mode. Telemetry continues when
-thresholds are absent. Native servo errors and transport/write failures remain explicit failures.
+After admission, clear pending normal intents and bind exclusive ownership to peer credentials,
+originating connection and daemon boot epoch. A session ID identifies this session; no extra
+token is necessary. Reconnecting can inspect status but cannot resume ownership or replay motion.
 
-### Stop semantics
+Torque-on is explicit and selected. For each selected off motor: read a fresh position, seed its
+goal with that measured coordinate, verify goal readback within conversion quantization, then
+enable torque and read back torque state. Failure skips enabling that motor. That initial hold
+is bounded by the session lease alone; it is not a position command with a second expiry timer.
+Never re-enable or reseed an already-on motor as a side effect of a repeated on request.
 
-Choose the session stop action explicitly: proposed v1 is `torque_off` on the motors whose
-torque the session enabled. An authorized robot.relax remains an all-joint emergency torque-off
-without a session token. The exact treatment of motors already torqued at acquisition must be
-settled before implementation; preview/status must expose the controlled torque set. Do not
-silently extend that set to other joints or restore prior torque on release.
+The controlled set includes every motor confirmed enabled by the session and every motor whose
+enable outcome is uncertain. Keep uncertain motors in that set until confirmed off. Status exposes
+this set, its uncertainty and per-motor torque readback. Starting all-off makes stop ownership
+unambiguous; no prior torque is restored on exit.
 
-Stop does not return home or seek the initial pose. A helper returns only on its normal planned
-completion; cancel/failure never triggers that return. Report requested stop, actual last command,
-readback and `stopped` versus `stop_unconfirmed`. A bus fault can prevent physical confirmation;
-a successful RPC is not proof that torque is off. Retain authority in a faulted state until the
-operator resolves it. No recovery movement or reboot is automatic.
+### Position validity and lease
 
-## 4. Proposed local API
+The lease is the only session-liveness clock. Suggested default: keepalive every 100 ms, expiry
+after 300 ms, server-monotonic time; measure scheduling tolerance before shipping. A stale or
+non-increasing keepalive sequence is rejected and does not renew the lease. Connection close,
+lease expiry or explicit release stops **the full controlled set** and closes the session.
 
-JSON-RPC 2.0 on the existing /run/robotd.sock. All names below are new proposals. Implement typed
-messages in duck-ipc-proto, bump API_VERSION and ship robotd/robotctl together. Report skew;
-do not invent alternate interfaces for old versions.
+Each accepted position command has `valid_for_ms`, initially 1..60000. Its server deadline starts
+when the control thread commits it, not at request arrival. Expiry cuts torque **only on motors
+whose latest accepted target still belongs to that command**; it does not cut an unrelated head,
+mouth or leg hold. A later target supersedes expiry independently per selected motor. Keepalive
+does not extend target validity; a new command can. Torque-on holds with no subsequent target
+remain lease-bounded. Torque-off clears the selected target deadlines. No implicit re-enable.
 
-### Inspection, telemetry and artifacts
+### Partial outcomes and stopping
 
-| Method | Inputs | Result |
+No atomic multi-servo transaction or automatic rollback. A request attempts all selected motors
+and returns individual outcomes; one gain/enable failure does not stop unrelated motors:
+
+| Operation | Failure/verification semantics |
+|---|---|
+| Goal sync write | Transport success is `sent`, not acknowledgement by each servo. Optional scheduled goal-register readback can later report `readback_confirmed` or `mismatch`; neither proves physical arrival. Send failure is `write_failed`/delivery unknown. |
+| Gain write | Read back all requested P/I/D registers. On failure report unknown/partial values; no implicit torque change. A retry rereads and repairs only explicitly requested settings. |
+| Torque-on | If seeding/readback fails, leave that motor off and report it. If enable or torque readback is uncertain, attempt off, retain it in the controlled set and enter stop-unconfirmed handling if off cannot be verified. |
+| Torque-off | Attempt each selected motor, then verify off. Any unconfirmed off creates a fault latch; do not report success from a sent packet alone. |
+
+Uncertain command delivery is logged; it does not invent a confirmed per-ID result from a
+broadcast. The caller can inspect or stop. Native servo error/status remains visible; no automatic
+reboot, homing or recovery movement. Explicit stop stops the entire controlled set, clears its
+pending targets and leaves the same live session acquired if off is confirmed. It never returns
+to a previous pose. Command expiry uses the narrower set above.
+
+Stop confirmation can fail. Keep a daemon-level `stop_unconfirmed` inhibit **separate from the
+connection-bound session**: it prevents normal writes/new acquisition even after the client
+disconnects, records affected motors, and survives session closure until off is confirmed.
+`release` is always admitted from faulted and retries stop; connection loss closes the session
+and performs the same stop attempts, without making the inhibit disappear. A new authorized
+local `cancel` or existing robot.relax can retry off without reviving the session. Successful
+readback clears the inhibit; unreachable hardware remains explicitly unresolved, not an orphaned
+session requiring a daemon restart. No automatic return to normal writes while off is unconfirmed.
+
+### Existing calls and exit
+
+| Existing operation during ownership or stop inhibit | Behaviour |
+|---|---|
+| Health, model, mode reads, robot.subscribe | Continue as read-only operations |
+| robot.relax, including the existing pad/transport relax action | Retain current authorization/transport reachability; terminate the session and attempt all-joint torque-off. Report outcome and retain inhibit if unconfirmed. |
+| robot.stop | Refuse `diagnostic_owned`; zeroing walking twist is not a maintenance stop. Use diagnostics.stop/cancel or relax. |
+| init, enable, move, head/look/pose/mouth, skills, mode changes, policy loads, rest, shutdown and rebootMotors | Refuse `diagnostic_owned`; discard/count notifications instead of queuing them for exit. Relax first if a subsequent rest/shutdown/reboot is wanted. |
+
+Do not add new uid restrictions to existing relax or other normal-mode calls. New maintenance
+mutations have their own authorization below. Sound/light readouts can continue only when they
+do not initiate actuator/owner transitions. Centralize actuator admissions so a handler does not
+quietly modify intent/config and return success during the session.
+
+Confirmed exit sets bringup=Limp, enabled=false, clears pending control/skill/power requests,
+forgets skill/controller state, invalidates gain caches, and seeds the normal hold from fresh
+known positions. If fresh position data is unavailable, remain write-inhibited until available.
+The first subsequent normal apply tick may rewrite normal global P/I/D with torque off; this is
+not delayed until the next enable. Only a new explicit normal enable may energize motors again.
+Never resume old intent or issue normal goal/gain writes before confirmed off. Normal-mode
+protection configuration/features are unchanged throughout.
+
+Check maintenance/inhibit **before** safeToRestart's fallen/moving shortcuts. Report unsafe
+through ownership and any unresolved inhibit, even when the robot is lying down. This does not
+protect against a hung process or power loss: v1 documents measured native host-loss behaviour;
+servo watchdog integration is deferred.
+
+## 4. Minimal local API
+
+JSON-RPC 2.0 on /run/robotd.sock; proposed routes, not implemented. Add typed protocol messages,
+bump API_VERSION from the baseline 44 when implementing, and ship robotd/robotctl together.
+
+| Method | Request | Result/effect |
 |---|---|---|
-| `robot.diagnostics.inspect` | Optional sections: identity, motors, control, safety, policy, sensors | Cached snapshot ID/boot epoch, values, per-field times and validity |
-| `robot.diagnostics.refresh` | Sections | Bounded read-only refresh operation; no corrective register writes |
-| `robot.diagnostics.capabilities` | None | All 15 motors, supported backend operations, register ranges and units; no protection-profile gate |
-| `robot.diagnostics.status` | Optional session ID | Owner, mode, active command/experiment, lease and torque/gain state |
-| `robot.diagnostics.subscribe` | Rate 1..50 Hz, fields | Ordered telemetry/events with gaps, freshness and robot monotonic timestamps |
-| `robot.diagnostics.record.start` | Label, max duration/bytes | Passive recorder ID, no torque/ownership change |
-| `robot.diagnostics.record.stop` | Recording ID | Idempotent finalization and export ID |
-| `robot.diagnostics.report` | Run or recording ID | Manifest, summaries and completeness |
-| `robot.diagnostics.export.read` | Export/artifact ID, offset, bounded byte count | Finalized artifact chunk and digest; no arbitrary filesystem paths |
+| `robot.diagnostics.capabilities` | `{}` | All 15 motor/ID entries, backend support, position/PID representation and refresh budgets |
+| `robot.diagnostics.inspect` | Optional sections: identity,motors,control | Immutable cached snapshot, boot epoch and field-level observation times/status |
+| `robot.diagnostics.refresh` | Sections, request ID | Bounded scheduled read, no correction/write; operation ID/outcome in status |
+| `robot.diagnostics.status` | `{}` | Current owner/session, lease, controlled set, readback, last outcomes and independent stop inhibit |
+| `robot.diagnostics.acquire` | Monotonic request ID, `mode:maintenance_raw`, `acknowledge_raw:true` | Commit exclusive ownership with entry checks; returns session ID, lease duration and snapshot |
+| `robot.diagnostics.torque` | Session ID, request ID, joints, `on:bool` | Selective seeded torque-on or verified torque-off |
+| `robot.diagnostics.gains` | Session ID, request ID, map joint→`{p,i,d}` | Per-joint RAM PID write/readback; require complete triplets of raw unsigned register integers |
+| `robot.diagnostics.command` | Session ID, request ID, positions_rad map, valid_for_ms | Selected absolute targets and per-motor expiry |
+| `robot.diagnostics.keepalive` | Session ID, increasing keepalive sequence | Renew only this connection's lease |
+| `robot.diagnostics.stop` | Session ID, request ID | Priority stop full controlled set; retain live session when confirmed |
+| `robot.diagnostics.release` | Session ID, request ID | Stop and close, with confirmed-off exit or independent inhibit |
+| `robot.diagnostics.cancel` | Request ID | Authorized administrative stop/close or inhibit recovery from a different local connection |
 
-Motor entries expose joint/ID, installation identity/confidence, model/firmware, homing expected/
-observed/startup preimage, operating/drive mode, hardware error, torque, P/I/D, native position/
-velocity/current/PWM limits, voltage and temperature. Desired values and hardware readback are
-separate. Null/unavailable is never zero. Diagnostic position is in the runtime coordinate
-convention; also expose raw encoder counts with explicit units. Do not apply a second homing
-offset in clients.
+No token, diagnostics.subscribe, arm, prepare/run, relative command, record/export/report or
+in-session reboot API in v1. Keep read-only inspect/status available without session ownership.
+Refresh is globally rate-limited to protect the bus budget; no general register-address RPC.
 
-Expose generated, received, written and previous successful targets with write outcomes; policy
-and config digests; loop timing, bus errors and repeated IMU data. Pickup/fall status remains
-visible with `enforced:false` and reason `maintenance_raw`. If the pickup model is out of domain,
-show applicability/validity rather than presenting its probability as a reliable lift verdict.
+PID values are raw u16 registers, not physical SI gains; capabilities publishes the actual
+model-specific accepted P/I/D ranges and the server validates them before writes. Each selected
+motor requires a complete triplet so an unseen old I/D value is not silently retained. RAM changes
+are not persisted to configuration. Native operating/drive modes, profile velocity/acceleration,
+limits, goal position, torque and gains are inspected explicitly, with unsupported values marked
+unavailable. Existing current magnitude semantics remain unchanged; signed current/PWM can be
+additional fields from the already-read fast block without affecting policy/pickup features.
 
-### Raw maintenance operations
+### Delivery, identity and bounded retry
 
-| Method | Inputs | Effect |
-|---|---|---|
-| `robot.diagnostics.acquire` | Request ID, `mode:maintenance_raw`, explicit acknowledgement, stop action | Exclusive session/token and lease; no torque or motion |
-| `robot.diagnostics.torque` | Session/token, request ID, selected joints, enabled | Explicit selective torque change with fresh-goal seeding on enable |
-| `robot.diagnostics.gains` | Session/token, request ID, per-joint P/I/D | Write/readback RAM position gains; no persistent config change |
-| `robot.diagnostics.command` | Session/token, request ID, selected absolute targets, validity duration | Direct position targets on the next accepted tick, no behavioural modification |
-| `robot.diagnostics.prepare` | Session/token, request ID, finite experiment parameters | Resolve preview/digest, starting snapshot, writes, duration and optional abort criteria; no motion |
-| `robot.diagnostics.run` | Session/token, request ID, plan ID/digest | Execute one finite helper experiment |
-| `robot.diagnostics.keepalive` | Session/token, increasing sequence | Renew lease; never repeat or generate motion |
-| `robot.diagnostics.stop` | Session/token or authorized administrative cancel, request ID | Priority stop with explicit confirmation status |
-| `robot.diagnostics.release` | Session/token | Stop, then release; no normal-controller resumption |
+A mutation response distinguishes queued from committed/failed and includes operation sequence,
+commit tick, per-motor sent/readback/failed states and observation times. No sync-write result is
+labelled native refusal unless an actual status/readback provides that evidence. Clients inspect
+status after an uncertain acknowledgement instead of blindly re-running commands.
 
-No separate arm step is required: raw mode is entered explicitly once, and torque enable is
-explicit. This keeps routine motor debugging direct. prepare/run is optional convenience;
-command is available without a preview or a physical-protection readiness check.
-
-Use local maintenance authorization based on Unix credentials, not socket reachability alone.
-Do not expose these mutations through BLE/UDP/WebRTC/Space routes. Trusted SSH invokes the local
-client; a locally running relay is still a relay, not an operator. Read refresh is rate-limited;
-record creation is authorized and quota-limited. All messages are bounded and reject unknown
-fields, unknown/duplicate joints, NaN/infinity, unrepresentable register values and wrong modes.
-Protocol validation is not an anatomical limit. Hardware-representable targets are not silently
-clipped; rejected and hardware-refused values are reported distinctly.
-
-Results distinguish queued/committed/failed, include command/run sequence, applied tick and
-per-motor outcome. Idempotency prevents repeating motion after a lost acknowledgement. Relevant
-errors: unauthorized, controller_active, diagnostic_owned, unsupported_backend, wrong_mode,
-invalid_value, stale_snapshot, stale_plan, bus_fault, lease_expired, request_conflict and
-stop_unconfirmed. No protection_disabled/not_applicable/profile_unvalidated refusal in raw mode.
+Use strictly increasing u64 request IDs per session, a high-water mark and a bounded cache of
+the last 256 outcomes/payload digests. Cached same ID/same payload returns the prior result;
+changed payload is request_conflict. An older evicted ID returns request_expired and never
+executes again. Invalid out-of-order IDs do not advance motion. keepalive has its own sequence.
+A duplicate acquire on the owning connection returns its existing outcome; acquisition while
+already owned is busy. Administrative cancel uses connection-local monotonic IDs and is naturally
+idempotent. All pending/outcome storage is bounded. Define exact sizes/timeouts as implementation
+constants, not unbounded per-client maps.
 
 ```json
 {
   "jsonrpc": "2.0", "id": 7, "method": "robot.diagnostics.command",
   "params": {
-    "session_id": "session-opaque", "token": "connection-bound",
-    "request_id": "position-1",
-    "positions_rad": {"left_hip_roll": 0.05},
-    "valid_for_ms": 500
+    "session_id": "session-opaque", "request_id": 7,
+    "positions_rad": {"head_roll": 0.05}, "valid_for_ms": 500
   }
 }
 ```
 
-This is a shape example, not an approved angle for a particular assembly. The same command
-accepts every canonical joint, including mouth. It requires previously enabled selected torque;
-writing a goal must never enable torque implicitly. On validity expiry, end that command with
-the session stop action; keepalive alone does not extend an old target's validity. A new request
-can explicitly extend/replace it. Relative commands use a separate unambiguous shape with
-snapshot ID and deltas, not heuristic interpretation of positions_rad.
+This illustrates the schema, not an approved physical target. It requires explicit previous
+torque-on for that selected motor. Goal writes never enable torque implicitly. Every canonical
+motor name including mouth uses the same shape. Reject unknown fields/joints, duplicate map keys,
+NaN/infinity, unsupported modes and native-unrepresentable values before enqueueing I/O.
 
-### CLI
+### Authorization and transport
 
-One robotctl diagnose group:
+robotd does not currently implement configd's Unix peer mutation policy. Add an equivalent
+PeerPolicy for **new diagnostic mutations only**: daemon owner plus named maintenance users/
+groups, unavailable peer credentials denied. Separate this from the socket's existing 0660 group
+reachability. Provision the operator's local account explicitly; do not grant maintenance to a
+shared relay group. Known mediad/btd relay uids are explicitly denied before allow-group checks;
+record requesting credentials in outcomes. Do not assume a local relay is a local mechanic.
+
+Add explicit false arms for maintenance methods to btd/mediad exhaustive route tables and check
+any Space/console proxy paths. Do not restrict existing read/relax routes as a side effect.
+Authorized local SSH executes the CLI; no new HTTP/UDP API. Read-only inspect/capabilities/status
+are ungated beyond socket access, matching existing conventions; refresh is a quota-limited read.
+
+## 5. CLI and telemetry
+
+Standalone commands: `robotctl diagnose inspect --json`, `capabilities`, `status`, `watch` and
+`cancel`. watch consumes **robot.subscribe**, not a second diagnostics stream. cancel opens a
+new authorized connection and invokes administrative cancel, not an owner-only stop.
+
+Use one persistent process for active operations:
 
 ```text
-robotctl diagnose inspect --json
-robotctl diagnose list
-robotctl diagnose watch --joint head_roll
-robotctl diagnose enter --mode maintenance-raw
-robotctl diagnose torque --joint head_roll --on
-robotctl diagnose position --joint head_roll --rad 0.05 --duration-ms 500
-robotctl diagnose gains --joint head_roll --p 100 --i 0 --d 0
-robotctl diagnose stop
-robotctl diagnose report <run-id>
+robotctl diagnose session --mode maintenance-raw
+# commands read on this process's stdin:
+torque head_roll on
+gains head_roll p=100 i=0 d=0
+position head_roll rad=0.05 valid_for_ms=500
+stop
+release
 ```
 
-Proposed commands, unavailable on today's robot. A persistent interactive session owns the
-connection/heartbeat; these subcommands execute inside that session, not as unrelated processes
-that lose ownership immediately. A programmatic client uses the same connection-bound RPC API.
-Entry displays the bypassed behaviours and explicit raw acknowledgement once. No hold-to-run,
-camera readiness or per-command confirmation is required. Explicit --deg is a human convenience;
-canonical wire/stored positions use radians. Status always labels maintenance_raw prominently.
-Suites can offer setup pauses without requiring a classifier or a motor-specific admission path.
+Proposed syntax, not executable on today's robot. The process acquires once with explicit raw
+acknowledgement, owns the connection and sends keepalive while running. Interactive input or
+scripted stdin use the same contract; no per-command confirmation or hold-to-run. EOF releases,
+Ctrl-C cancels/releases, and Ctrl-Z suspension permits the lease to expire. The CLI must not
+leave a separate heartbeat process alive after its owner is suspended or exits. A fresh terminal
+uses cancel rather than borrowing the old session ID. CLI gain units/valid_for_ms names match
+the wire. Explicit deg input can convert to canonical radians without changing the server API.
 
-## 5. Timing, camera and records
+Extend RobotState with an optional maintenance block: mode/session, controlled torque set and
+readback, per-joint PID state, latest command/write result, lease/deadlines, stop inhibit, and
+pickup/fall enforcement status `false`/maintenance_raw. Preserve normal RobotState semantics;
+expose maintenance received/written targets distinctly so a viewer does not mistake a desired
+value for a successful physical response. Keep frames timestamped/sequenced with freshness/drop
+information. A sensor reading in tick n precedes the newly written target in tick n: include the
+previous successful command sequence for response analysis.
 
-Sensor read precedes the newly generated command in a tick. Record acquisition sequence,
-received/generated target, actual write and outcome, and previous successful command sequence.
-Same-tick error is not the settled response to the new target. Preserve position/velocity signs;
-keep existing currents_ma magnitude semantics. Signed current is a new separately named raw
-field, not a reinterpretation of policy/pickup inputs.
+The client records this stream and mutation outcomes to JSONL using robot monotonic time/boot
+epoch and optional wall-clock labels. Slow registers have their own observation timestamps;
+null is not zero. A slow subscriber/disk writer drops or marks incomplete client evidence without
+blocking robotd or changing raw motor commands. No server disk retention/exports to implement.
+Camera capture/synchronization and statistics can be independent tools later; neither is a gate.
 
-Robot monotonic timestamps and boot epoch order samples; UTC plus uncertainty labels sessions.
-Registers have individual read times. Gaps, stale/coasted samples and drops are explicit. A
-bounded ring and writer queue keep disk/network work out of the tick. Disk full or camera loss
-marks recordings incomplete and is reported; raw motor commands are not silently interrupted
-by evidence collection. An optional experiment abort rule can explicitly request that behaviour.
-Reserve space for terminal events and bound retention/bytes/duration.
+## 6. Implementation and tests
 
-External USB capture stays on the laptop, onboard media in mediad. Neither gates motor access.
-Video frame times plus host↔robot timestamp exchanges/RTT bounds provide approximate alignment,
-not hardware-trigger accuracy. Capture video and reference measurements as explicit attachments;
-support bundles omit media and credentials by default.
-
-Each report includes identities/install generations, software/config/policy digests, raw-mode
-bypass status, native register snapshots, selected torque/gains, commands and per-motor outcomes,
-lease/stop events, timestamps/freshness, optional operator setup annotations and attachment hashes.
-Summaries distinguish stable holds from transients: signed bias/MAE, settling time, overshoot,
-current, thermal/voltage ranges and timing gaps. Unsettled data is not a valid zero measurement.
-A failed, skipped, blocked or untested motor remains explicit in all-motor reports. Vetbook keeps
-brief outcome links, not the full time series in its capped event list.
-
-## 6. Calibration and persistence
-
-Raw position/gain testing does not imply EEPROM write access. V1 never changes homing, drive/
-operating mode, native shutdown/limits, replacement identity or DEFAULT_POSITION. These need a
-separate explicit persistent transaction, preimage/readback and interruption recovery. No startup
-correction is hidden in inspect/refresh. All RAM test changes and observed native restrictions
-are recorded; a later normal enable explicitly reestablishes its own settings.
-
-A later calibration workflow compares repeated external angle references across poses and
-approach directions with uncertainty. Neither target error nor dynamic asymmetry identifies
-horn alignment. Per-robot corrections would need one persistent source shared by startup,
-adoption and maintenance, preserving policy coordinates and addressing old-release rollback.
-Do not infer a physical serial number or transfer an old motor's reference to its replacement.
-
-## 7. Implementation slices and validation
-
-| Slice | Deliverable | Expected files |
+| Slice | Result | Files/seams |
 |---|---|---|
-| 1. Inspection | All-15 inventory, honest readback/startup preimages, timing and passive reports | duck-control/src/{io,bus}.rs; robotd/src/{main,diagnostics}.rs; duck-ipc-proto/src/{lib,diagnostics}.rs; robotctl/src/diagnostics.rs |
-| 2. Raw session | Exclusive authority, scoped behavioural bypass, selective torque/gain and direct position API, stop/lease semantics | Existing Safety/RobotIo boundary, diagnostics modules, normal authority selection and params |
-| 3. Recording and experiments | Finite helpers, suites, telemetry and camera associations for all 15 motors | Same controller/API plus reporting and laptop recorder; no extra execution daemon |
+| 1. Inspection | All-15 inventory, readback including torque/goal/PID/native profiles, bounded refresh, startup preimages | duck-control/src/{io,bus}.rs; duck-ipc-proto/src/{lib,diagnostics}.rs; robotd/src/diagnostics.rs |
+| 2. Raw controller | Required selective operations, exclusive Safety-owned I/O path, entry/exit/inhibit rules and local authorization | duck-control/src/safety.rs and FakeIo; robotd/src/{main,intents,diagnostics}.rs; configd PeerPolicy pattern; deployment maintenance grant |
+| 3. API/CLI | Typed methods, existing stream extension, persistent session/client JSONL and route exclusions | robotctl, duck-ipc-proto, mediad/src/route.rs, btd/src/route.rs; API/version/docs tests |
 
-Test normal and maintenance paths separately. Raw commands must not be changed/refused because
-of pickup, fall, missing IMU classifier, posture, advisory collision ranges, current/tracking
-warnings or camera state. Normal mode must retain its original protections and features. Test
-entry/exit/crash recovery without persistent protection/config changes or automatic policy resume.
+Parameterize all motor operation tests over exact JOINT_NAMES/JOINT_IDS, independently of policy
+action order. FakeIo tracks per-ID torque/goals/PID and normal versus maintenance write counts.
+Assert no normal gate/apply/global-gain write while owned or inhibited, selected sync-write IDs
+only, no accidental mouth/head command path, unchanged homing conversion, and normal protections
+outside maintenance. No special knee code or priority.
 
-Parameterize FakeIo tests over the exact 15 names/IDs, including mouth, selected write/torque/gain
-sets, stale relative snapshots and absence of unintended activation. Cover ownership races,
-retries, partial torque/gain failure, failed goal seeding, invalid/non-finite values, connection
-close, command duration/lease expiry, recorder stalls, emergency stop with a full mailbox, and
-confirmed versus unconfirmed stops. Enforce hardware value representation and selected operating
-mode without adding hidden software motion constraints. Validate JSON and all transport denials.
+Test admission with any torque on/unknown, enabled/pending intent races, two clients, acquire
+without movement, stale/readback-seeding failures, already-on repeat, complete PID range checking,
+partial operations, sent-versus-readback outcomes, request replay/eviction, per-command expiry
+superseded on only part of its joint set, and no unrelated motor torque-off. Cover lease expiry,
+Ctrl-Z-equivalent loss, connection close and stop priority with a full ordinary mailbox.
 
-Check helper trajectories/timing in simulation; it does not certify real friction/backlash or
-mechanical clearance. Supervised bench validation uses the same protocol for all 15 motors, with
-operator-chosen setups/targets and independent torque-off available. Measure actual write/read
-ordering, selective torque/gains, lease stop latency, partial errors, loss-of-host behaviour and
-normal-mode restoration. Publish those limitations rather than claiming raw mode is protected.
-Update API_VERSION/roundtrips, CLI/docs and actual relay allow-lists. No installation, movement
-or protection change on the real robot is part of this design PR.
+Test release/relax/cancel from every state including faulted after disconnect; independent inhibit
+recovery from a new connection; confirmed-off postconditions, enabled reset/Limp/controller forget,
+normal gain rewrite on the next tick and no automatic torque enable. A false/missing off readback
+must not open the normal write path. Check safeToRestart before fallen shortcuts. Exercise every
+existing actuator method's admission table, including rejected notifications being cleared.
 
-## 8. Decisions remaining
+Check mutation peer policy and relay uid refusal, actual transport route arms, JSON roundtrips,
+field units, bounded buffers and refresh cost. No pickup/fall/support/IMU-classifier or camera
+readiness refusal in raw operation; native transport/value/mode failures remain explicit.
 
-1. Set exact target validity/lease durations and stop action, especially ownership of motors
-   already torqued on entry. Verify behaviour after a host crash; decide whether to use the
-   servo watchdog without conflating it with pickup/fall protection.
-2. Choose RAM gain/torque readback semantics and recovery for partially successful operations.
-   Define native range/mode validation and error reporting; no silent clipping.
-3. Finalize typed command/relative/suite shapes, telemetry rates, disk budgets and retention.
-4. Keep raw v1 in position mode with RAM PID/torque control; persistent calibration writes and
-   additional actuator operating modes remain separate explicit extensions.
+Bench validation measures selective torque/gain/goal readback, command/lease stop timing, partial
+bus failures and native host-loss behaviour for all 15 motors with operator-selected setups.
+Existing reboot recovery is release → rebootMotors → relax/readback → fresh acquisition.
+Simulation checks message/coordinate/timing behaviour, not physical clearance, backlash or friction.
+Do not promise stop-on-process-crash until separately implemented and measured. No servo watchdog
+or new protection qualification framework is required to land this v1.
 
-Agreed: raw maintenance is separate from normal operation, bypasses behavioural protections,
-works uniformly across all 15 motors and retains one robotd bus owner. No new support/pickup
-protection framework or physical-profile qualification is required before implementing it.
+## 7. Fixed choices and remaining implementation details
+
+Fixed for v1: all-off readback acquisition; one connection/session; no redundant token; selected
+raw goals/torque/full-triplet RAM PID; per-command expiry affecting only its latest selected
+motors; lease/stop/release affecting the controlled set; existing relax unchanged; independent
+stop inhibit recoverable by local cancel; persistent CLI; existing telemetry/client recording.
+Calibration writes, other operating modes, helpers/suites/camera/robot-side reports are deferred.
+
+Before coding, approve this exact admission/exit/partial-outcome contract as a unit. Implementation
+then pins model-specific native ranges, bounded refresh/mailbox time budgets, permission deployment
+and telemetry payload sizes from the existing hardware/code. Lease defaults and actual stop/host-loss
+behaviour need bench measurement; they do not reopen the agreed raw-mode scope or add behavioural
+protection gates. Later persistent calibration would require an explicit source of truth shared
+by startup/adoption/maintenance and its own interruption/rollback design.
