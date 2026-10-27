@@ -15,7 +15,9 @@ Neither is an isolated actuator test. A separate serial script would fight robot
 The useful product is a small diagnostic instrument inside robotd, not a general scripting
 engine: inspect first, preview a finite experiment, acquire exclusive authority, run it under
 on-board bounds, and export enough evidence to explain the result. The same path should support
-head/leg inspection, replacement commissioning and later calibration reference measurements.
+inspection and individual testing of **all 15 motors**, including the mouth, replacement
+commissioning and later calibration reference measurements. All-motor coverage is a release
+requirement, not an optional extension after the knee example works.
 It must not infer calibration from walking asymmetry or silently alter the robot to make a test pass.
 
 ### Evidence behind this proposal
@@ -110,7 +112,7 @@ Keepalive renews a bounded on-board deadline; suggested initial values for revie
 client period and 300 ms expiry. Their suitability must be measured under normal scheduling.
 An absolute session duration and per-run duration prevent keepalive from granting unlimited motion.
 
-While owned, mutating pad, head, skill, policy-load, init and mode requests are rejected with
+While owned, mutating pad, head/look, mouth, skill, policy-load, init and mode requests are rejected with
 `diagnostic_owned`; continuous notifications are discarded and counted. Telemetry names the
 owner and suppressed source. Old intents, pending skills and enabled-state requests are cleared
 on entry and exit. No automatic return to an old policy, no delayed pad command on release.
@@ -160,11 +162,56 @@ speed/acceleration, gain, current/temperature/voltage limits, run time and stop 
 bound to the hardware/MJCF and coordinate convention. No such supine profile is approved today.
 The ±π actuator clamp is insufficient; there is no generic safe test amplitude for every pose.
 
-Initial active primitive: one-joint `approach_hold_return`, with a smooth bounded trajectory,
+Initial active primitive, available to every one of the 15 named motors through its qualified
+profile: one-joint `approach_hold_return`, with a smooth bounded trajectory,
 returning to its acquisition angle only on normal completion. Multiple repeats are finite.
 Then `bidirectional_sweep` within the same envelope and `paired_compare`, executing left and
 right serially under explicit mirrored coordinates. Independent simultaneous joint tests and
 arbitrary keyframes are deferred. A user can request lower limits, never exceed the profile.
+
+### Required coverage: all 15 motors
+
+Use `duck-ipc-proto::JOINT_NAMES` and `JOINT_IDS` as the authoritative inventory. Do not derive
+the testable set from the policy action vector: the mouth is absent from that vector but is
+still an independently testable actuator. Every primitive uses this same name/ID mapping.
+
+| Motor | Bus ID | Profile constraints to qualify |
+|---|---:|---|
+| `left_hip_yaw` | 20 | Supported trunk; foot/leg sweep clear of table, opposite leg and cables |
+| `left_hip_roll` | 21 | Supported trunk; lateral leg clearance and coupled hip configuration |
+| `left_hip_pitch` | 22 | Supported trunk; hip/knee/ankle configuration and table clearance |
+| `left_knee` | 23 | Supported thigh/leg; knee travel and foot clearance |
+| `left_ankle` | 24 | Supported leg; foot travel, shell and table clearance |
+| `neck_pitch` | 30 | Independently supported head; neck/head chain, cable and shell clearance |
+| `head_pitch` | 31 | Head support; neck/head coupled clearance and camera orientation |
+| `head_yaw` | 32 | Neck pose, cable twist, shell and lateral sweep clearance |
+| `head_roll` | 33 | Head support, cable and shell clearance; gravity load recorded |
+| `mouth` | 34 | Beak opening interval, linkage/pinch clearance and conservative effort limits |
+| `right_hip_yaw` | 10 | Same checks as left yaw, with explicit right-side coordinates |
+| `right_hip_roll` | 11 | Same checks as left roll, with explicit right-side coordinates |
+| `right_hip_pitch` | 12 | Same checks as left pitch, with explicit right-side coordinates |
+| `right_knee` | 13 | Same checks as left knee, with explicit right-side coordinates |
+| `right_ankle` | 14 | Same checks as left ankle, with explicit right-side coordinates |
+
+These are qualification requirements, not approved numerical limits. A single supine setup
+need not allow all axes safely. Profiles may cover leg, supported neck/head and mouth setups
+separately; each declares its support, applicable protection, selected joint bounds and other
+joint behaviour. The normal mouth open/close range is useful model data, not by itself a
+qualified diagnostic envelope. Do not move the head to expose a camera view as an implicit
+side effect of testing a leg or the mouth.
+
+Each motor must support passive inspect/record, dry-run preview, and—once its profile is
+qualified—individual approach/hold/return and bidirectional sweep. Mirrored paired comparison
+applies to the five left/right leg pairs; unpaired head/mouth joints support repeated
+before/after comparison instead. A blocked or absent motor still has an inventory entry with
+the precise reason; it is never silently omitted or reported as passing.
+
+An optional `suite` is only a finite ordered list of these existing single-joint experiments,
+not a new trajectory language. Preview displays all 15 coverage results and groups requiring
+a setup change. The operator confirms the new setup before each group; re-acquire, fresh
+snapshots and protection readiness are required after a change. Only one motor is exercised
+at a time. No automatic all-body homing, simultaneous sweep or unattended progression.
+Stop/fault aborts the suite; continuing requires an explicitly prepared new run.
 
 Non-selected joints are either torque-off or hold-at-entry, declared per profile and exposed
 in preview. Do not assume zero target is harmless. V1 should prefer torque-off on non-selected
@@ -207,7 +254,7 @@ profile readiness; version skew is reported, not used to invent an alternate uns
 |---|---|---|
 | `robot.diagnostics.inspect` | `sections?: [identity,motors,control,safety,policy,sensors]` | Immutable cached snapshot, snapshot ID, boot epoch, per-section age/validity and pending refresh state |
 | `robot.diagnostics.refresh` | `sections` | Bounded read-only refresh request/operation ID; never correct registers or change torque |
-| `robot.diagnostics.capabilities` | `{}` | Supported primitives, profile revisions/status/reasons and non-raising limits, export schema |
+| `robot.diagnostics.capabilities` | `{}` | All 15 joint/ID entries, per-joint primitive and profile readiness/reasons, profile revisions and non-raising limits, export schema |
 | `robot.diagnostics.status` | `session_id?` | Current authority, state, readiness blockers, active run, last terminal outcome |
 | `robot.diagnostics.subscribe` | `hz: 1..50, include?: [...]` | Stream with sample sequence, robot monotonic clock, freshness/drop counts and events |
 | `robot.diagnostics.record.start` | `label, max_duration_s, max_bytes` | Read-only recorder ID and finite bounds; no torque or ownership implied |
@@ -313,6 +360,13 @@ values and gives concrete blockers, such as `supported_supine_v1: protection not
 it cannot acquire ownership or start motion. This administrative stop is audited and still
 separate from the all-joint torque-off meaning of `robot.relax`.
 
+`robotctl diagnose list` renders the same 15-entry capabilities inventory with per-motor
+inspect/preview/motion readiness. `--joint` accepts each canonical name, including `mouth`;
+it is not restricted to leg joints. A future `diagnose suite --all --preview` reports coverage
+and required setups without motion; executing a suite retains the per-group confirmation and
+per-run API contract above. Suite reports explicitly distinguish pass, fail, blocked, skipped
+and not tested for every motor, including tests aborted before their turn.
+
 ## 6. Timing, camera and reports
 
 Record the acquisition/read sequence, generated target sequence, safety-applied target, write
@@ -394,7 +448,7 @@ generations so a replaced servo does not inherit an old physical measurement aut
 | 1. Honest inspection | Cached motor/register snapshots, startup preimages, desired versus readback, effective pickup applicability, bounded refresh, passive export | `duck-control/src/{io,bus}.rs`, `robotd/src/{main,diagnostics,pickup}.rs`, `duck-ipc-proto/src/{lib,diagnostics}.rs`, `robotctl/src/diagnostics.rs` |
 | 2. Offline session engine | Lease/authority state machine, trajectory preview, fault-stop specification and recorder tested with FakeIo; capabilities explicitly refuse unvalidated hardware motion | Same modules; `duck-control/src/diagnostics.rs`; fake/simulation backends |
 | 3. Protection commissioning | Qualified supported fixture/profile, selective torque/readback, host-loss watchdog, support/lift detection and measured stop latency; no profile available without evidence | `duck-control/src/{safety,pickup,bus,model}.rs`, `robotd/src/pickup.rs`, versioned profile data and commissioning record |
-| 4. Small physical experiment | One selected joint, slow approach/hold/return, local robotctl hold-to-run, USB capture, complete report; no other joints unintentionally energized | Diagnostic API/CLI plus focused laptop recorder script; transport exclusion tests |
+| 4. Individual motor tests | Commission one knee first, then qualify profiles and individual approach/hold/return for all 15 motors, including neck/head and mouth; local robotctl hold-to-run, USB capture, complete report and no unintended joint activation. A knee-only implementation does not complete this slice. | Diagnostic API/CLI plus focused laptop recorder script; transport exclusion tests; per-joint profile data |
 | 5. Comparative tools | Bidirectional sweep, sequential mirrored comparisons, external-reference attachment and report diff | Same API experiment enum and offline reporting; no new execution framework |
 
 Add diagnostic parameters to `robotd-params` only for resource bounds/approved profiles, with
@@ -422,6 +476,13 @@ and diagnostic reporting cannot change the numerical features fed to existing po
 Replay the existing short traces as *analysis fixtures* if made available, not golden proof
 of physical safety. Synthetic lag/step traces verify phase alignment and `not_settled` results.
 
+Parameterize inventory, preview and active-controller FakeIo tests over all 15 canonical joints,
+checking exact IDs, selected torque/gain/write sets and absent-motor outcomes. Assert coverage
+against JOINT_NAMES/JOINT_IDS, separately from the 14-action policy map. Include mouth normal
+control and head/look arbitration, coupled neck/head and opposite-leg constraints, and sequential
+suite interruption/setup changes. Qualification records must include one result for every motor;
+an unvalidated profile is reported as blocked, never counted as successful all-motor support.
+
 Simulator validation checks target generation and collisions against the selected model,
 but cannot qualify real fixture support, backlash, friction, current thresholds or pickup.
 Physical commissioning starts with a dummy fixture/one unloaded joint, independent stop means
@@ -445,4 +506,6 @@ changes. Only validated profiles ship as motorized capabilities.
 5. Keep persistent calibration writes and arbitrary trajectory/policy experiments outside v1.
 
 These are deliberate scope boundaries. The smallest useful first change is honest inspection
-and a replayable report; the next is one safe, observable, isolated knee experiment.
+and a replayable report for all 15 motors. Commissioning starts with one isolated knee, then
+must extend to qualified individual tests for all 15 motors; that first knee is not the finished
+feature. General raw actuation and calibration writes remain outside the scope.
