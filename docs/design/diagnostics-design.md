@@ -1,10 +1,10 @@
 # All-motor diagnostics and raw maintenance v1
 
-**Design proposal — not implemented.** This page owns diagnostic sessions and their API.
+**v1 implementation contract.** This page owns diagnostic sessions and their API.
 [robotd-design.md](robotd-design.md) owns normal control and bus mechanisms;
 [architecture.md](architecture.md) owns service/transport authority. This revision narrows v1
-following a read-only Claude Code scope review of `b3841c5` and resolves the session semantics
-needed before implementation. No robot installation, movement or configuration change is included.
+following a read-only Claude Code scope review of `b3841c5`. The implementation follows the
+session semantics below; see [the operator guide](../robot/diagnostics.md) for actual commands.
 
 ## 1. Scope
 
@@ -224,14 +224,14 @@ servo watchdog integration is deferred.
 
 ## 4. Minimal local API
 
-JSON-RPC 2.0 on /run/robotd.sock; proposed routes, not implemented. Add typed protocol messages,
-bump API_VERSION from the baseline 44 when implementing, and ship robotd/robotctl together.
+JSON-RPC 2.0 on /run/robotd.sock, typed in duck-ipc-proto, API_VERSION 45. Install the whole
+daemon release so robotd, robotctl and the transport route tables share this contract.
 
 | Method | Request | Result/effect |
 |---|---|---|
 | `robot.diagnostics.capabilities` | `{}` | All 15 motor/ID entries, backend support, position/PID representation and refresh budgets |
-| `robot.diagnostics.inspect` | Optional sections: identity,motors,control | Immutable cached snapshot, boot epoch and field-level observation times/status |
-| `robot.diagnostics.refresh` | Sections, request ID | Bounded scheduled read, no correction/write; operation ID/outcome in status |
+| `robot.diagnostics.inspect` | `{}` (complete cached snapshot) | Immutable cached snapshot, boot epoch and field-level observation times/status |
+| `robot.diagnostics.refresh` | Request ID (refreshes the motor inventory) | Bounded scheduled read, no correction/write; operation ID/outcome in status |
 | `robot.diagnostics.status` | `{}` | Current owner/session, lease, controlled set, readback, last outcomes and independent stop inhibit |
 | `robot.diagnostics.acquire` | Monotonic request ID, `mode:maintenance_raw`, `acknowledge_raw:true` | Commit exclusive ownership with entry checks; returns session ID, lease duration and snapshot |
 | `robot.diagnostics.torque` | Session ID, request ID, joints, `on:bool` | Selective seeded torque-on or verified torque-off |
@@ -287,11 +287,10 @@ NaN/infinity, unsupported modes and native-unrepresentable values before enqueue
 
 ### Authorization and transport
 
-robotd does not currently implement configd's Unix peer mutation policy. Add an equivalent
-PeerPolicy for **new diagnostic mutations only**: daemon owner plus named maintenance users/
-groups, unavailable peer credentials denied. Separate this from the socket's existing 0660 group
+robotd uses a maintenance-only counterpart of configd's Unix peer mutation policy. The
+policy applies to **new diagnostic mutations only**: daemon owner plus named maintenance users, unavailable peer credentials denied. Separate this from the socket's existing 0660 group
 reachability. Provision the operator's local account explicitly; do not grant maintenance to a
-shared relay group. Known mediad/btd relay uids are explicitly denied before allow-group checks;
+shared relay group. Known mediad/btd relay uids are explicitly denied before user grants;
 record requesting credentials in outcomes. Do not assume a local relay is a local mechanic.
 
 Add explicit false arms for maintenance methods to btd/mediad exhaustive route tables and check
@@ -317,7 +316,7 @@ stop
 release
 ```
 
-Proposed syntax, not executable on today's robot. The process acquires once with explicit raw
+Syntax implemented by this v1. The process acquires once with explicit raw
 acknowledgement, owns the connection and sends keepalive while running. Interactive input or
 scripted stdin use the same contract; no per-command confirmation or hold-to-run. EOF releases,
 Ctrl-C cancels/releases, and Ctrl-Z suspension permits the lease to expire. The CLI must not
@@ -333,7 +332,8 @@ value for a successful physical response. Keep frames timestamped/sequenced with
 information. A sensor reading in tick n precedes the newly written target in tick n: include the
 previous successful command sequence for response analysis.
 
-The client records this stream and mutation outcomes to JSONL using robot monotonic time/boot
+The client can record this stream to JSONL with `session --record PATH` or `watch` redirection,
+and mutation outcomes on stdout to a separate JSONL file using robot monotonic time/boot
 epoch and optional wall-clock labels. Slow registers have their own observation timestamps;
 null is not zero. A slow subscriber/disk writer drops or marks incomplete client evidence without
 blocking robotd or changing raw motor commands. No server disk retention/exports to implement.
@@ -384,8 +384,7 @@ motors; lease/stop/release affecting the controlled set; existing relax unchange
 stop inhibit recoverable by local cancel; persistent CLI; existing telemetry/client recording.
 Calibration writes, other operating modes, helpers/suites/camera/robot-side reports are deferred.
 
-Before coding, approve this exact admission/exit/partial-outcome contract as a unit. Implementation
-then pins model-specific native ranges, bounded refresh/mailbox time budgets, permission deployment
+The implementation pins model-specific native ranges, bounded refresh/mailbox time budgets, permission deployment
 and telemetry payload sizes from the existing hardware/code. Lease defaults and actual stop/host-loss
 behaviour need bench measurement; they do not reopen the agreed raw-mode scope or add behavioural
 protection gates. Later persistent calibration would require an explicit source of truth shared

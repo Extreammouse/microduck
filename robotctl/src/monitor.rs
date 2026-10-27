@@ -4929,6 +4929,7 @@ mod tests {
 
     fn a_state() -> proto::RobotState {
         proto::RobotState {
+            maintenance: None,
             t: 1.0,
             movement: proto::MoveState {
                 requested: [0.0; 3],

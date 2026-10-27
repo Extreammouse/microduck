@@ -470,7 +470,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// laser sweep, nearest object — merged into the vet book by `robotd`, which owns it. The book
 /// gains three maps for them ([`vetbook::Life::tallies`], `highs`, `lows`), additive: an older
 /// book loads with them empty. A new route: a `robotd` predating it answers METHOD_NOT_FOUND.
-pub const API_VERSION: u32 = 44;
+pub const API_VERSION: u32 = 45;
 
 /// The observation width every policy this robot family runs is built against.
 ///
@@ -505,6 +505,7 @@ pub const UPDATE_MAX_SILENCE_SECONDS: u64 = 600;
 
 pub const DEFAULT_SOCKET: &str = "/run/updaterd.sock";
 
+pub mod diagnostics;
 pub mod led;
 pub mod vetbook;
 
@@ -1074,6 +1075,7 @@ pub enum Call {
     Subscribe,
 
     // ── robot.* ──────────────────────────────────────────────────────────────
+    RobotDiagnostics(diagnostics::Call),
     RobotSafeToRestart,
     RobotHealth,
     RobotModelApi,
@@ -1265,6 +1267,7 @@ impl Call {
     /// The wire method name.
     pub fn method(&self) -> &'static str {
         match self {
+            Call::RobotDiagnostics(p) => p.method(),
             Call::Hello(_) => method::HELLO,
             Call::Check(_) => method::CHECK,
             Call::Apply(_) => method::APPLY,
@@ -1352,6 +1355,9 @@ impl Call {
     /// `updaterd` authorises exactly these against the caller's uid/gid; read-only calls
     /// are ungated, so support can inspect a robot it is not allowed to change.
     pub fn is_mutating(&self) -> bool {
+        if let Call::RobotDiagnostics(p) = self {
+            return p.mutating();
+        }
         matches!(
             self,
             Call::Apply(_)
@@ -1439,6 +1445,7 @@ impl Call {
             // Reads a file, like `log`. Bounded by the per-run caps `updater::transcript`
             // enforces at write time, so the answer cannot grow without limit however long
             // a hook talked for.
+            Call::RobotDiagnostics(_) => (Robot, Prompt),
             Call::Show(_) => (Updater, Prompt),
             // `check` is one HTTP round trip. `install` downloads a policy set and then asks
             // `robotd` to reload, which is the same order of magnitude as a small update — long,
@@ -1597,6 +1604,7 @@ impl Call {
             Call::Show(p) => encode(p),
             Call::RobotMove(p) => encode(p),
             Call::RobotHead(p) => encode(p),
+            Call::RobotDiagnostics(p) => p.params().unwrap_or_else(|| serde_json::json!({})),
             Call::RobotLook(p) => encode(p),
             Call::RobotEnable(p) => encode(p),
             Call::RobotDo(p) => encode(p),
@@ -1678,6 +1686,9 @@ impl Call {
                 .map_err(|e| Error::new(code::INVALID_PARAMS, e.to_string()))
         }
 
+        if method_name.starts_with("robot.diagnostics.") {
+            return diagnostics::Call::parse(method_name, params).map(Call::RobotDiagnostics);
+        }
         Ok(match method_name {
             method::HELLO => Call::Hello(decode(params)?),
             method::CHECK => Call::Check(decode(params)?),
@@ -3958,6 +3969,8 @@ impl IntentResult {
 /// `requested` rather than the stream carrying only outcomes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RobotState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<diagnostics::Status>,
     /// Seconds since the daemon started. Monotonic: it is for correlating samples, not for
     /// telling the time.
     pub t: f64,
@@ -6444,6 +6457,7 @@ mod tests {
         // Only the fields this test is about; everything else is `a_state()`'s business, so
         // the next field added to `RobotState` does not have to be typed out again here.
         let state = RobotState {
+            maintenance: None,
             movement: MoveState {
                 requested: [0.4, 0.0, 0.0],
                 applied: [0.15, 0.0, 0.0],
@@ -6529,6 +6543,7 @@ mod tests {
     /// — so an additive field is one line here rather than one line per test.
     fn a_state() -> RobotState {
         RobotState {
+            maintenance: None,
             t: 1.5,
             movement: MoveState {
                 requested: [0.0; 3],

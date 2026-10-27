@@ -113,6 +113,7 @@ impl StaleImuTracker {
 }
 
 pub struct DynamixelIo {
+    startup_homing: [Option<i32>; NUM_JOINTS],
     controller: Xl330Controller,
     /// Kept so the port can be reopened at the factory baud rate: `rustypot` owns the serial
     /// handle outright and offers no way to change its speed in place.
@@ -141,6 +142,7 @@ impl DynamixelIo {
         ids.extend_from_slice(&JOINT_IDS);
 
         Ok(Self {
+            startup_homing: [None; NUM_JOINTS],
             controller,
             port: port.to_owned(),
             ids,
@@ -221,6 +223,9 @@ impl DynamixelIo {
                 expected: 1,
                 got: 0,
             })?;
+        if let Some(i) = JOINT_IDS.iter().position(|v| *v == id) {
+            self.startup_homing[i].get_or_insert(got);
+        }
         if got != want {
             tracing::warn!(
                 id,
@@ -511,6 +516,83 @@ pub fn replacement_target(missing: &[u8]) -> Option<u8> {
 }
 
 impl RobotIo for DynamixelIo {
+    fn diagnostic_read(&mut self, id: u8) -> Result<crate::diagnostics::Motor> {
+        let i = crate::diagnostics::index(id)?;
+        // One bounded read for one motor; never fifteen register scans in a tick.
+        let blocks = self
+            .controller
+            .sync_read_raw_data(&[id], 0, 148)
+            .map_err(|e| IoError::Bus(e.to_string()))?;
+        let b = blocks
+            .first()
+            .filter(|b| b.len() == 148)
+            .ok_or(IoError::ShortRead {
+                what: "diagnostic registers",
+                expected: 148,
+                got: blocks.first().map_or(0, Vec::len),
+            })?;
+        let u16at = |n: usize| u16::from_le_bytes([b[n], b[n + 1]]);
+        let i32at = |n: usize| i32::from_le_bytes([b[n], b[n + 1], b[n + 2], b[n + 3]]);
+        let rad = |n: usize| 2.0 * PI * i32at(n) as f64 / 4096.0 - PI;
+        let mut m = crate::diagnostics::empty_motor(id)?;
+        m.model_number = Some(u16at(0));
+        m.firmware_version = Some(b[6]);
+        m.hardware_error = Some(b[70]);
+        m.voltage_v = Some(u16at(144) as f64 * 0.1);
+        m.temperature_c = Some(b[146]);
+        m.current_limit = Some(u16at(38));
+        m.pwm_limit = Some(u16at(36));
+        m.velocity_limit = Some(i32at(44) as u32);
+        m.shutdown = Some(b[63]);
+        m.torque = Some(b[64] != 0);
+        m.position_counts = Some(i32at(132));
+        m.goal_rad = Some(rad(116));
+        m.pid = Some(crate::diagnostics::Pid {
+            p: u16at(84),
+            i: u16at(82),
+            d: u16at(80),
+        });
+        m.homing_offset_counts = Some(i32at(20));
+        m.before_startup_fix = self.startup_homing[i];
+        m.operating_mode = Some(b[11]);
+        m.drive_mode = Some(b[10]);
+        m.min_position_rad = Some(rad(52));
+        m.max_position_rad = Some(rad(48));
+        m.profile_velocity = Some(i32at(112) as u32);
+        m.profile_acceleration = Some(i32at(108) as u32);
+        Ok(m)
+    }
+    fn diagnostic_goals(&mut self, goals: &[(u8, f64)]) -> Result<()> {
+        for &(id, q) in goals {
+            crate::diagnostics::index(id)?;
+            if !crate::diagnostics::position_valid(q) {
+                return Err(IoError::Bus("invalid_value".into()));
+            }
+        }
+        let ids: Vec<_> = goals.iter().map(|g| g.0).collect();
+        let q: Vec<_> = goals.iter().map(|g| g.1).collect();
+        self.controller
+            .sync_write_goal_position(&ids, &q)
+            .map_err(|e| IoError::Bus(e.to_string()))
+    }
+    fn diagnostic_torque(&mut self, id: u8, on: bool) -> Result<()> {
+        crate::diagnostics::index(id)?;
+        self.controller
+            .write_torque_enable(id, on)
+            .map_err(|e| IoError::Bus(e.to_string()))
+    }
+    fn diagnostic_pid(&mut self, id: u8, p: crate::diagnostics::Pid) -> Result<()> {
+        crate::diagnostics::index(id)?;
+        if !crate::diagnostics::pid_valid(p) {
+            return Err(IoError::Bus("invalid_value".into()));
+        }
+        self.controller
+            .write_position_p_gain(id, p.p)
+            .and_then(|_| self.controller.write_position_i_gain(id, p.i))
+            .and_then(|_| self.controller.write_position_d_gain(id, p.d))
+            .map_err(|e| IoError::Bus(e.to_string()))
+    }
+
     fn read(&mut self) -> Result<Sensors> {
         let blocks = self
             .controller

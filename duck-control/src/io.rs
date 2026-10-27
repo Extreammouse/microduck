@@ -113,6 +113,20 @@ pub struct ImuStale {
 }
 
 pub trait RobotIo {
+    /// Native selective maintenance operations. Unsupported backends refuse, never widen selection.
+    fn diagnostic_read(&mut self, _id: u8) -> Result<crate::diagnostics::Motor> {
+        Err(IoError::Bus("unsupported_backend".into()))
+    }
+    fn diagnostic_goals(&mut self, _goals: &[(u8, f64)]) -> Result<()> {
+        Err(IoError::Bus("unsupported_backend".into()))
+    }
+    fn diagnostic_torque(&mut self, _id: u8, _on: bool) -> Result<()> {
+        Err(IoError::Bus("unsupported_backend".into()))
+    }
+    fn diagnostic_pid(&mut self, _id: u8, _pid: crate::diagnostics::Pid) -> Result<()> {
+        Err(IoError::Bus("unsupported_backend".into()))
+    }
+
     /// One transaction: joints and IMU together.
     fn read(&mut self) -> Result<Sensors>;
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
@@ -217,6 +231,12 @@ pub struct ServoIdentity {
 /// needs no hardware, no network and no Docker. Positions echo back whatever was last
 /// written, so a loop driving it behaves like a servo that tracks perfectly.
 pub struct FakeIo {
+    pub diagnostic_torques: [bool; NUM_JOINTS],
+    pub diagnostic_pids: [crate::diagnostics::Pid; NUM_JOINTS],
+    pub diagnostic_goals: [f64; NUM_JOINTS],
+    pub diagnostic_writes: Vec<u8>,
+    pub diagnostic_fail_id: Option<u8>,
+
     sensors: Sensors,
     /// Set to make the next [`RobotIo::read`] fail, then cleared. For exercising the
     /// loop's error path without a flaky bus.
@@ -264,6 +284,11 @@ impl FakeIo {
         Self {
             sensors: Sensors::default(),
             fail_next_read: false,
+            diagnostic_torques: [false; NUM_JOINTS],
+            diagnostic_pids: [crate::diagnostics::Pid { p: 200, i: 0, d: 0 }; NUM_JOINTS],
+            diagnostic_goals: [0.0; NUM_JOINTS],
+            diagnostic_writes: vec![],
+            diagnostic_fail_id: None,
             fail_reads: 0,
             last_written: None,
             reads: 0,
@@ -331,6 +356,62 @@ impl FakeIo {
 }
 
 impl RobotIo for FakeIo {
+    fn diagnostic_read(&mut self, id: u8) -> Result<crate::diagnostics::Motor> {
+        if self.diagnostic_fail_id == Some(id) {
+            return Err(IoError::Simulated);
+        }
+        let i = crate::diagnostics::index(id)?;
+        let mut m = crate::diagnostics::empty_motor(id)?;
+        m.torque = Some(self.diagnostic_torques[i]);
+        m.goal_rad = Some(self.diagnostic_goals[i]);
+        m.position_counts = Some(
+            (4096.0 * (std::f64::consts::PI + self.sensors.positions[i])
+                / (2.0 * std::f64::consts::PI)) as i32,
+        );
+        m.pid = Some(self.diagnostic_pids[i]);
+        m.operating_mode = Some(3);
+        m.drive_mode = Some(0);
+        m.min_position_rad = Some(-std::f64::consts::PI);
+        m.max_position_rad = Some(std::f64::consts::PI * 4094.0 / 4096.0);
+        m.homing_offset_counts = Some(crate::model::homing_offset(id));
+        Ok(m)
+    }
+    fn diagnostic_goals(&mut self, goals: &[(u8, f64)]) -> Result<()> {
+        for &(id, q) in goals {
+            let i = crate::diagnostics::index(id)?;
+            if self.diagnostic_fail_id == Some(id) {
+                return Err(IoError::Simulated);
+            }
+            if !crate::diagnostics::position_valid(q) {
+                return Err(IoError::Bus("invalid_value".into()));
+            }
+            self.diagnostic_goals[i] = q;
+            self.diagnostic_writes.push(id);
+        }
+        Ok(())
+    }
+    fn diagnostic_torque(&mut self, id: u8, on: bool) -> Result<()> {
+        if self.diagnostic_fail_id == Some(id) {
+            return Err(IoError::Simulated);
+        }
+        let i = crate::diagnostics::index(id)?;
+        self.diagnostic_torques[i] = on;
+        self.diagnostic_writes.push(id);
+        Ok(())
+    }
+    fn diagnostic_pid(&mut self, id: u8, pid: crate::diagnostics::Pid) -> Result<()> {
+        if self.diagnostic_fail_id == Some(id) {
+            return Err(IoError::Simulated);
+        }
+        let i = crate::diagnostics::index(id)?;
+        if !crate::diagnostics::pid_valid(pid) {
+            return Err(IoError::Bus("invalid_value".into()));
+        }
+        self.diagnostic_pids[i] = pid;
+        self.diagnostic_writes.push(id);
+        Ok(())
+    }
+
     fn read(&mut self) -> Result<Sensors> {
         if self.fail_next_read {
             self.fail_next_read = false;
@@ -360,6 +441,7 @@ impl RobotIo for FakeIo {
 
     fn set_torque(&mut self, on: bool) -> Result<()> {
         self.torque = Some(on);
+        self.diagnostic_torques.fill(on);
         self.torque_writes += 1;
         Ok(())
     }
